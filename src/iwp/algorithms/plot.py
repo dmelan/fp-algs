@@ -64,7 +64,7 @@ def plot_all_algorithms_convergence(
             ["MSE", "MAE", "Objective function"],
         ):
             iters = len(values)
-            ax.plot(
+            p = ax.plot(
                 range(iters),
                 values,
                 label=label_name,
@@ -75,6 +75,7 @@ def plot_all_algorithms_convergence(
             ax.set_ylabel(label)
             if label == "Objective function":
                 ax.set_yscale("log")
+            ax.grid(True)
 
             # Draw a cross marker if the algorithm stopped before reaching max_iterations
             if iters < algo.max_iterations:
@@ -91,7 +92,7 @@ def plot_all_algorithms_convergence(
                     range(iters - 1, n_iterations),
                     [values[-1]] * (n_iterations - iters + 1),
                     linestyle=":",
-                    color="black",
+                    color=p[0].get_color(),
                 )
     if results:
         top_axs[2].legend(
@@ -128,13 +129,15 @@ def plot_objective_functions_by_algorithm(list_of_algo_lists, visuals_path, add_
             label_name = algo.algo_plot_name
             values = algo.f_values
             iters = len(values)
-            axs[idx].plot(
+            p = axs[idx].plot(
                 range(iters),
                 values,
                 label=label_name,
                 marker="o" if add_marker else None,
                 markersize=4 if add_marker else None,
             )
+
+            # Draw a cross marker if the algorithm stopped before reaching max_iterations
             if iters < algo.max_iterations:
                 axs[idx].plot(
                     iters - 1,
@@ -143,17 +146,20 @@ def plot_objective_functions_by_algorithm(list_of_algo_lists, visuals_path, add_
                     color="black",
                     markersize=10,
                 )
+            
+            # Draw a dotted line for constant continuation to max_iterations
             if iters < max_iterations:
                 axs[idx].plot(
                     range(iters - 1, max_iterations),
                     [values[-1]] * (max_iterations - iters + 1),
                     linestyle=":",
-                    color="black",
+                    color=p[0].get_color(),
                 )
         axs[idx].set_xlabel("Iteration")
         axs[idx].set_ylabel("Objective function")
         axs[idx].set_yscale("log")
         axs[idx].legend(loc="upper right", fontsize=14)
+        axs[idx].grid(True)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     if save:
         plt.savefig(os.path.join(visuals_path, "Objective_by_algorithm.pdf"))
