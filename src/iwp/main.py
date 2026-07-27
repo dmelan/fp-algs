@@ -8,6 +8,7 @@ from iwp.algorithms.algorithms import (
     FISTA,
     ClosedFormSolution,
     NesterovAcceleratedGradientDescent,
+    DistributedBlockGradientDescent
 )
 from iwp.algorithms.plot import plot_all_algorithms_convergence
 from iwp.data.export import export_all_metrics_to_csv, save_complex_vector
@@ -189,8 +190,25 @@ if __name__ == "__main__":
         K_eigenvalues_J_3 = np.linalg.eigvals(K_op_J_3.toarray())
         return np.max(np.abs(K_eigenvalues_J_3))
 
-    # ================================ No noise case ================================
+    # Distributed Gradient Descent
+    def get_grad_u(d_list, rho):
+        def grad_u(i,u_i,m):
+            return C_star @ (C @ u_i - d_list[i]) + rho * (A_star @ (A @ u_i - B_list[i] @ m))
+        return grad_u
 
+    def get_grad_m(agent_indices, dg, rho):
+        def grad_m(s, m, u_list):
+            grad_sum = np.zeros_like(m)
+            for i in agent_indices[s]:
+                grad_sum += B_list[i].conj().T @ (B_list[i] @ m - A @ u_list[i])
+            return rho * grad_sum + (1.0 / S) * dg(m)
+        return grad_m
+
+    # Tikhonov gradient:
+    def dg_tikhonov(mu=1.0):
+        return lambda m: mu * m
+    # ================================ No noise case ================================
+    '''
     # Get functions and Lipschitz constants
     J_1 = get_J_1(d, lambd, mu_1)
     dJ_1 = get_dJ_1(d, lambd, mu_1)
@@ -208,10 +226,10 @@ if __name__ == "__main__":
     dJ_3 = get_dJ_3(d_list, mu_3)
     K_J_3 = get_K_J_3(mu_3)
     logger.info(f"Lipschitz constant K_J_3: {K_J_3}")
-
+    '''
     x_0 = np.zeros(I * L + P, dtype=np.complex128)  # shape: (I*L + P,)
     max_iterations = int(args.max_iterations)
-
+    '''
     # Run algorithms
     algo_1 = ClosedFormSolution(
         exp_name=args.exp_name,
@@ -266,16 +284,91 @@ if __name__ == "__main__":
     save_complex_vector(
         os.path.join(args.results_path, "C-NAGD_PredictedVectorm.dat"), m_3
     )
+    '''
 
+    # create agent_indices (round-robin)
+    S = 2  # choose number of agents
+    agent_indices = [[i for i in range(s, I, S)] for s in range(S)]
+
+    # mixing matrix: simple symmetric averaging
+    W = np.full((S, S), 1.0 / S)
+
+    rho = 1.0
+    alpha = 1e-3  # step size — tune (must be small enough; use Lipschitz if available) Will do estimation later
+    grad_u = get_grad_u(d_list, rho)
+    dg = dg_tikhonov(mu=mu_1)  # or your TV / dg
+    grad_m = get_grad_m(agent_indices, dg, rho)
+    J_1 = get_J_1(d, lambd, mu_1)
+
+    algo_dbgd = DistributedBlockGradientDescent(
+        exp_name=args.exp_name,
+        algo_plot_name="D-BGD",
+        f=lambda x: J_1(x),
+        grad_u=grad_u,
+        grad_m=grad_m,
+        S=S,
+        W=W,
+        alpha=alpha,
+        P=P,
+        L=L,
+        I=I,
+        agent_indices=agent_indices,
+        use_mpi=args.use_mpi if hasattr(args, "use_mpi") else False,  # set via config or CLI; requires mpi4py and mpirun
+        logger=logger,
+        verbose=args.verbose,
+    )
+    
+    # Log agent index distribution and per-rank ownership for diagnostics
+    try:
+        total_indices = sum(len(lst) for lst in agent_indices)
+        counts = [len(lst) for lst in agent_indices]
+    except Exception:
+        total_indices = None
+        counts = None
+
+    if algo_dbgd.use_mpi:
+        # rank 0 prints the global distribution
+        if algo_dbgd.rank == 0:
+            logger.info(f"Agent indices distribution (total={total_indices}): {counts}")
+        # every rank prints which local agents it owns and how many indices that corresponds to
+        local_agents = algo_dbgd.local_agents if algo_dbgd.local_agents is not None else []
+        local_count = sum(len(agent_indices[s]) for s in local_agents) if counts is not None else None
+        logger.info(f"Rank {algo_dbgd.rank}/{algo_dbgd.world_size} local_agents={local_agents} -> {local_count} indices")
+    else:
+        logger.info(f"Running without MPI. Agent indices distribution (total={total_indices}): {counts}")
+
+    x_final = algo_dbgd.run(x0=x_0, max_iterations=max_iterations)
+    m_dbgd = x_final[-P:]
+
+    # Only let rank 0 (or the single non-MPI run) produce plots and write results
+    if not algo_dbgd.use_mpi or algo_dbgd.rank == 0:
+        algo_dbgd.plot_algorithm_convergence(m, args.visuals_path)
+        export_all_metrics_to_csv(
+            algo_dbgd, os.path.join(args.results_path, "D-BGD_Metrics.csv")
+        )
+        save_complex_vector(
+            os.path.join(args.results_path, "D-BGD_PredictedVectorm.dat"), m_dbgd
+        )
+        plot_all_algorithms_convergence(
+            algorithms=[algo_dbgd],
+            visuals_path=args.visuals_path,
+            show=False,
+            save=True,
+            show_time_memory=True,
+            results=True,
+        )
+'''
     plot_all_algorithms_convergence(
-        algorithms=[algo_1, algo_2, algo_3],
+        algorithms=[algo_1, algo_2, algo_3, algo_dbgd],
         visuals_path=args.visuals_path,
         show=False,
         save=True,
         show_time_memory=True,
         results=True,
     )
+'''
 
+'''
     # ================================ Noise case ================================
 
     if args.enable_noise:
@@ -406,3 +499,4 @@ if __name__ == "__main__":
             std = arr.std(axis=-1)
             for i, algo in enumerate(algo_names):
                 logger.info(f"{algo} {metric}: mean={mean[i]:.6f}, std={std[i]:.6f}")
+'''

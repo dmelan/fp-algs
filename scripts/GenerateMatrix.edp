@@ -1,7 +1,5 @@
-load "iovtk"
-
 // Global parameters
-string OutputDir = "../data/";
+string OutputDir = "data/";
 
 real k = 1.;
 real lambda = 2. * pi / k;

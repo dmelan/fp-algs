@@ -1,0 +1,122 @@
+// Parametrized variant of GenerateMatrix.edp used to generate two small
+// sweeps referenced in the Part 4/5 comparison notebook:
+//   (a) a source-count sweep (I = 2, 4, 8, 16, 32) at fixed mesh density,
+//       to empirically test the SMW-vs-cached-factorization crossover
+//       predicted in Sec. 5.8-5.9 ("sweep (a): Source sweep");
+//   (b) a mesh-refinement sweep (delta = 10, 20, 40) at fixed I = 2, to
+//       empirically confirm ||A|| = O(1/h^2) while ||C|| stays roughly
+//       constant -- the structural claim motivating Algorithm 5's
+//       mesh-robust step sizes (Sec. 5.1, 5.8: "sweep (b): Field-mesh
+//       sweep").
+// Geometry and wavenumber are otherwise identical to GenerateMatrix.edp.
+// Writes to its own output directory so the reference dataset in data/ is
+// untouched.
+//
+// Usage: FreeFem++ -nw scripts/GenerateMatrixSweep.edp -I 8 -delta 10 -out data/sweep/I8/
+//
+// Note: this FreeFEM build does not expose `getARGV`, so command-line flags
+// are parsed by hand from the raw `ARGV` array below.
+
+string OutputDir = "data/sweep/I2/";
+int I = 2;
+int delta = 10;
+for (int i = 0; i < ARGV.n - 1; i++) {
+  if (ARGV[i] == "-out") OutputDir = ARGV[i + 1];
+  if (ARGV[i] == "-I") I = atoi(ARGV[i + 1]);
+  if (ARGV[i] == "-delta") delta = atoi(ARGV[i + 1]);
+}
+
+real k = 1.;
+real lambda = 2. * pi / k;
+
+real[int] thetaSource(I);
+thetaSource = 0 : (2 * pi / I) : 2 * pi;
+
+{
+  ofstream fileoutput(OutputDir + "Thetasource.dat");
+  fileoutput << thetaSource;
+}
+
+real Rext = 5.;
+real Rint = 3.;
+int LabelExt = 1;
+int LabelInt = 2;
+border CercleExt(t = 0, 2. * pi) { x = Rext * cos(t); y = Rext * sin(t); label = LabelExt; }
+border CercleInt(t = 0, 2. * pi) { x = Rint * cos(t); y = Rint * sin(t); label = LabelInt; }
+real NbPtOnExtBorder = 2 * pi * Rext * delta / lambda;
+real NbPtOnIntBorder = 2 * pi * Rint * delta / lambda;
+cout << "I = " << I << ", NbPtOnExtBorder = " << NbPtOnExtBorder << ", NbPtOnIntBorder = " << NbPtOnIntBorder << endl;
+mesh Th = buildmesh(
+  CercleExt(NbPtOnExtBorder)
+  + CercleInt(NbPtOnIntBorder)
+);
+
+int[int] labelObject = [LabelExt];
+meshL ThN = extract(Th, label = labelObject);
+ThN = OrientNormal(ThN, unbounded = 1);
+
+int PtInt = Th(0., 0.).region;
+
+fespace FS0(Th, P0);
+fespace FS1(Th, P1);
+fespace FSL(ThN, P1);
+cout << "Dimension of the FS0 space: " << FS0.ndof << endl;
+cout << "Dimension of the FS1 space: " << FS1.ndof << endl;
+cout << "Dimension of the FSL space: " << FSL.ndof << endl;
+
+FS0 n0 = 1.0;
+FS0 n1 = 2. * cos(x) * (region == PtInt) + n0 * (region != PtInt);
+FS0<complex> m = n1 - n0;
+
+{
+  ofstream fileoutput(OutputDir + "Vectorm.dat");
+  fileoutput << m[];
+}
+
+varf a(u, v) = int2d(Th)(
+  -dx(u) * dx(v) - dy(u) * dy(v) + k^2 * u * v
+) + int1d(Th, LabelExt)(1.i * k * u * v);
+matrix<complex> ABorn = a(FS1, FS1);
+set(ABorn, solver = sparsesolver);
+
+{
+  ofstream fileoutput(OutputDir + "MatrixABorn.dat");
+  fileoutput << ABorn;
+}
+
+varf MesureTh(u, v) = int1d(Th, LabelExt)((dx(u) * N.x + dy(u) * N.y) * v);
+matrix Ctmp = MesureTh(FS1, FS1);
+matrix FS1toFSL = interpolate(FSL, FS1);
+matrix C = FS1toFSL * Ctmp;
+
+{
+  ofstream fileoutput(OutputDir + "MatrixC.dat");
+  fileoutput << C;
+}
+
+for (int itercapteur = 0; itercapteur < I; itercapteur++) {
+
+  func uIncident = exp(1.i * k * (cos(thetaSource(itercapteur)) * x + sin(thetaSource(itercapteur)) * y));
+
+  varf Lin(u, v) = - int2d(Th)(u * k^2 * v * uIncident);
+  matrix<complex> B = Lin(FS0, FS1);
+
+  {
+    ofstream fileoutput(OutputDir + "MatrixB_" + itercapteur + ".dat");
+    fileoutput << B;
+  }
+
+  varf LinIndice(unused, v) = - int2d(Th)(m * k^2 * v * uIncident);
+  complex[int] rhs = LinIndice(0., FS1);
+
+  FS1<complex> usol;
+  usol[] = ABorn^-1 * rhs;
+
+  FSL<complex> Mesure;
+  Mesure[] = C*usol[];
+
+  {
+    ofstream fileoutput(OutputDir + "Vectord_" + itercapteur + ".dat");
+    fileoutput << Mesure[];
+  }
+}

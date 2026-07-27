@@ -5,7 +5,7 @@ if [ $# -lt 1 ]; then
     exit 1
 fi
 
-OUTPUT_DIR="../data"
+OUTPUT_DIR="data"
 mkdir -p "$OUTPUT_DIR"
 
 file_name="$1"
