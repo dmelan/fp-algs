@@ -1,6 +1,7 @@
 import glob
 import logging
 import os
+import re
 
 import numpy as np
 
@@ -29,8 +30,14 @@ def load_experiment_data(data_path: str) -> tuple:
     C = load_sparse_matrix(os.path.join(data_path, "MatrixC.dat"), is_complex=False)
     m = load_vector(os.path.join(data_path, "Vectorm.dat"), is_complex=True)
 
-    # Find all files starting with "MatrixB_" in the experiment path
-    B_files = sorted(glob.glob(os.path.join(data_path, "MatrixB_*")))
+    # Find all files starting with "MatrixB_" in the experiment path, ordered by
+    # their numeric source index rather than lexicographically: plain sorting
+    # gives MatrixB_0, MatrixB_1, MatrixB_10, ... so from I >= 10 onwards B_list[i]
+    # would no longer correspond to the Vectord_{i}.dat loaded below.
+    B_files = sorted(
+        glob.glob(os.path.join(data_path, "MatrixB_*")),
+        key=lambda fname: int(re.search(r"MatrixB_(\d+)", os.path.basename(fname)).group(1)),
+    )
     logger.info(f"Found {len(B_files)} B matrices.")
 
     # Load all B matrices
