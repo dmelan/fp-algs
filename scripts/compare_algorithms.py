@@ -50,6 +50,8 @@ from iwp.algorithms.plot import plot_all_algorithms_convergence  # noqa: E402
 from iwp.data.load_experiment_data import load_experiment_data  # noqa: E402
 from iwp.experiments.comparison import (
     ProblemData,  # noqa: E402
+    block_step_sizes_algorithm3,
+    block_step_sizes_algorithm5,
     get_closed_form_solution_J_1,
     get_dJ_3,
     get_grad_J_2,
@@ -215,7 +217,7 @@ def run_algorithm3_and_5(pb, dirs, logger, mu=1e-6, max_iterations=30000):
         L=pb.L,
         P=pb.P,
         tau=tau3,
-        sigma=sigma3,
+        sigma_pde=sigma3,
         prox_dual_reg=None,
         logger=logger,
     )
@@ -324,7 +326,7 @@ def run_distributed_comparison(pb, dirs, logger, mu=1e-6, S=2, max_iterations=10
         L=pb.L,
         P=pb.P,
         tau=tau,
-        sigma=sigma,
+        sigma_pde=sigma,
         prox_dual_reg=make_tikhonov_dual_prox(mu),
         logger=logger,
     )
@@ -351,7 +353,7 @@ def run_distributed_comparison(pb, dirs, logger, mu=1e-6, S=2, max_iterations=10
             L=pb.L,
             P=pb.P,
             tau=tau,
-            sigma=sigma,
+            sigma_pde=sigma,
             prox_dual_reg=make_tikhonov_dual_prox(mu_variant),
             agent_indices=agent_indices,
             use_mpi=False,
@@ -424,7 +426,7 @@ def run_step_size_sensitivity(
             L=pb.L,
             P=pb.P,
             tau=tau3,
-            sigma=sigma3,
+            sigma_pde=sigma3,
             prox_dual_reg=None,
         )
         try:
@@ -507,6 +509,252 @@ def run_step_size_sensitivity(
 
 
 # ===========================================================================
+# Section 4b: block dual step sizes -- one sigma per dualized block instead
+# of a single scalar shared by both (Eq. 34 for Algorithm 3/4, Eq. 56 for
+# Algorithm 5).
+# ===========================================================================
+
+
+def _tv_energy(m, G, lambda_tv):
+    """`lambda_tv * ||G m||_{2,1}`, the regularizer the algorithms actually
+    minimize alongside the data term (with singleton groups, Sec. 5.2, the
+    group l2,1 norm is the plain l1 norm of the jumps)."""
+    return float(lambda_tv * np.sum(np.abs(G @ m)))
+
+
+def run_block_sigma_comparison(
+    pb,
+    dirs,
+    logger,
+    lambda_tv=1e-3,
+    S=2,
+    gammas=(0.3, 1.0, 3.0, 10.0),
+    max_iterations=3000,
+    safety=0.9,
+):
+    """Compare the scalar dual metric (`sigma_pde = sigma_reg`, Eq. (31)/(33))
+    against the block-diagonal one (`Sigma = diag(sigma_pde I, sigma_reg I)`,
+    Eq. (34)/(56)) on all three Chambolle-Pock instantiations, with Total
+    Variation enabled so that the regularizer block is actually present and
+    its `O(1/h)` scale differs from the other block's.
+
+    Controlled ablation. Both metrics are parametrized by the *same* knob
+    `gamma` (the primal/dual ratio) and placed at the *same* realized margin
+    `safety`, so that the only difference left between a `scalar_gammaX` and
+    the matching `block_gammaX` row is how the dual budget is split between
+    the two blocks:
+
+        scalar:  tau = safety/gamma,  sigma = gamma/||.||^2       (both blocks)
+        block:   tau ~ safety/gamma,  sigma_b = gamma/||._b||^2   (per block)
+
+    Both realize `condition_lhs = safety` (recorded per row). The scalar
+    parametrization is the one used in Sections 2/4 up to a reparametrization:
+    `gamma = sqrt(safety)*||.||` gives back `tau = sigma = sqrt(safety)/||.||`,
+    so the sweep brackets that convention rather than replacing it.
+
+    What to expect (Sec. 4.7 vs 5.6). For Algorithm 5 the block metric is a
+    genuine win: both `||C||` and `||G||` are moderate, so `sigma_dat` can be
+    raised far above `sigma_reg`. For Algorithm 3/4 the gain is bounded: the
+    PDE block keeps `||A||` inside `L`, so `sigma_pde <~ 1/(tau ||A||^2)`
+    however the metric is balanced, and only the TV block is relaxed.
+    """
+    logger.info("=== Section 4b: block (per-dualized-block) dual step sizes ===")
+    f = objective_data_fidelity(pb)
+    x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
+    G = pb.G
+    agent_indices = [[i for i in range(s, pb.I, S)] for s in range(S)]
+
+    l3 = l_operator_norm_algorithm3(pb, G=G)
+    k5 = k_operator_norm_algorithm5(pb, G=G)
+
+    # (label, metric, gamma, tau, sigma_block1, sigma_reg, condition LHS).
+    configs3, configs5, block_info = [], [], []
+    for gamma in gammas:
+        label_s, label_b = f"scalar_gamma{gamma:g}", f"block_gamma{gamma:g}"
+        # Scalar metric: a single sigma for both blocks, necessarily dictated
+        # by the larger of the two block norms (which is what ||L||/||K|| is).
+        sc3, sc5 = gamma / l3**2, gamma / k5**2
+        configs3.append((label_s, "scalar", gamma, safety / gamma, sc3, sc3, safety))
+        configs5.append((label_s, "scalar", gamma, safety / gamma, sc5, sc5, safety))
+
+        s3 = block_step_sizes_algorithm3(pb, G=G, gamma=gamma, safety=safety)
+        s5 = block_step_sizes_algorithm5(pb, G=G, gamma=gamma, safety=safety)
+        configs3.append(
+            (
+                label_b,
+                "block",
+                gamma,
+                s3["tau"],
+                s3["sigma_pde"],
+                s3["sigma_reg"],
+                s3["condition_lhs"],
+            )
+        )
+        configs5.append(
+            (
+                label_b,
+                "block",
+                gamma,
+                s5["tau"],
+                s5["sigma_dat"],
+                s5["sigma_reg"],
+                s5["condition_lhs"],
+            )
+        )
+        block_info.append(dict(gamma=gamma, **{f"alg3_{k}": v for k, v in s3.items()}))
+        block_info[-1].update({f"alg5_{k}": v for k, v in s5.items()})
+
+    if block_info:
+        b0 = block_info[0]
+        logger.info(
+            f"Block norms -- Alg3: ||L_pde||={b0['alg3_norm_pde']:.3f}, "
+            f"||L_tv||={b0['alg3_norm_reg']:.3f} "
+            f"(ratio {b0['alg3_norm_pde'] / b0['alg3_norm_reg']:.2f}); "
+            f"Alg5: ||K_dat||={b0['alg5_norm_dat']:.3f}, "
+            f"||K_tv||={b0['alg5_norm_reg']:.3f} "
+            f"(ratio {b0['alg5_norm_dat'] / b0['alg5_norm_reg']:.2f}). "
+            f"Scalar norms: ||L||={l3:.3f}, ||K||={k5:.3f}"
+        )
+
+    rows = []
+    curves = {"Alg3": {}, "Alg4": {}, "Alg5": {}}
+
+    def record(family, label, metric, gamma, algo, x, tau, sigma_a, sigma_b, lhs):
+        finite = bool(np.all(np.isfinite(x)))
+        m_hat = x[-pb.P :]
+        mse, mae = mse_mae(x, pb.m, pb.P) if finite else (np.nan, np.nan)
+        data_fit = float(algo.f_values[-1]) if finite else np.nan
+        tv = _tv_energy(m_hat, G, lambda_tv) if finite else np.nan
+        curves[family][label] = algo.f_values.copy()
+        rows.append(
+            dict(
+                algorithm=family,
+                variant=label,
+                metric=metric,
+                gamma=gamma,
+                tau=tau,
+                sigma_pde_or_dat=sigma_a,
+                sigma_reg=sigma_b,
+                sigma_ratio=sigma_b / sigma_a,
+                condition_lhs=lhs,
+                iterations=algo.iteration,
+                time_s=algo.cv_time,
+                data_fidelity=data_fit,
+                tv_energy=tv,
+                total_objective=data_fit + tv if finite else np.nan,
+                mse=mse,
+                mae=mae,
+                feasibility=float(np.linalg.norm(pb.E @ x)) if finite else np.nan,
+                diverged=not finite,
+            )
+        )
+
+    for label, metric, gamma, tau, sigma_pde, sigma_reg, lhs in configs3:
+        algo3 = ChambollePock(
+            exp_name="part45",
+            algo_plot_name=f"Alg3-TV-{label}",
+            f=f,
+            A=pb.A,
+            B=pb.B_list,
+            C=pb.C,
+            G=G,
+            d=pb.d_list,
+            I=pb.I,
+            L=pb.L,
+            P=pb.P,
+            tau=tau,
+            sigma_pde=sigma_pde,
+            sigma_reg=sigma_reg,
+            prox_dual_reg=make_tv_dual_prox(lambda_tv),
+        )
+        x3 = algo3.run(x0=x0, max_iterations=max_iterations)
+        record("Alg3", label, metric, gamma, algo3, x3, tau, sigma_pde, sigma_reg, lhs)
+
+        # Algorithm 4 reuses Algorithm 3's operator/metric; the regularizer
+        # weight is divided by S (Eq. (35) sums R once per agent, cf. the
+        # `DistributedChambollePock` docstring and Section 3).
+        algo4 = DistributedChambollePock(
+            exp_name="part45",
+            algo_plot_name=f"Alg4-TV-{label}",
+            f=f,
+            A=pb.A,
+            B=pb.B_list,
+            C=pb.C,
+            G=G,
+            d=pb.d_list,
+            S=S,
+            I=pb.I,
+            L=pb.L,
+            P=pb.P,
+            tau=tau,
+            sigma_pde=sigma_pde,
+            sigma_reg=sigma_reg,
+            prox_dual_reg=make_tv_dual_prox(lambda_tv / S),
+            agent_indices=agent_indices,
+            use_mpi=False,
+        )
+        x4 = algo4.run(x0=x0, max_iterations=max_iterations)
+        record("Alg4", label, metric, gamma, algo4, x4, tau, sigma_pde, sigma_reg, lhs)
+
+    for label, metric, gamma, tau, sigma_dat, sigma_reg, lhs in configs5:
+        projector = AffineConstraintProjector(pb.A, pb.B_list, method="smw")
+        algo5 = ProjectedChambollePock(
+            exp_name="part45",
+            algo_plot_name=f"Alg5-TV-{label}",
+            f=f,
+            C=pb.C,
+            d=pb.d_list,
+            I=pb.I,
+            L=pb.L,
+            P=pb.P,
+            tau=tau,
+            sigma_dat=sigma_dat,
+            sigma_reg=sigma_reg,
+            projector=projector,
+            reg_mode="tv",
+            G=G,
+            lambda_tv=lambda_tv,
+        )
+        x5 = algo5.run(x0=x0, max_iterations=max_iterations)
+        record("Alg5", label, metric, gamma, algo5, x5, tau, sigma_dat, sigma_reg, lhs)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(
+        os.path.join(dirs["results"], "section4b_block_sigma_comparison.csv"),
+        index=False,
+    )
+    norms_df = pd.DataFrame(block_info)
+    norms_df.to_csv(
+        os.path.join(dirs["results"], "section4b_block_norms.csv"), index=False
+    )
+
+    fig, axs = plt.subplots(1, 3, figsize=(18, 4.5))
+    colors = {float(g): f"C{j}" for j, g in enumerate(gammas)}
+    for ax, family in zip(axs, ["Alg3", "Alg4", "Alg5"]):
+        for label, fvals in curves[family].items():
+            metric, _, gamma_txt = label.partition("_gamma")
+            gamma = float(gamma_txt)
+            ax.plot(
+                np.clip(fvals, 1e-12, 1e12),
+                label=label,
+                color=colors.get(gamma),
+                linestyle="--" if metric == "scalar" else "-",
+                linewidth=1.2 if metric == "scalar" else 2.0,
+            )
+        ax.set_yscale("log")
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Data fidelity")
+        ax.set_title(f"{family}: scalar (dashed) vs block (solid)", fontsize=10)
+        ax.legend(fontsize=7)
+    plt.tight_layout()
+    plt.savefig(os.path.join(dirs["visuals"], "section4b_block_sigma_comparison.pdf"))
+    plt.close()
+
+    logger.info("Block vs scalar dual metric summary:\n" + df.to_string(index=False))
+    return df, curves, norms_df
+
+
+# ===========================================================================
 # Section 5: Total Variation (graph-gradient proxy G) vs Tikhonov
 # ===========================================================================
 
@@ -545,7 +793,7 @@ def run_tv_vs_tikhonov(
         L=pb.L,
         P=pb.P,
         tau=tau3,
-        sigma=sigma3,
+        sigma_pde=sigma3,
         prox_dual_reg=make_tikhonov_dual_prox(mu),
     )
     x, _ = run_and_record(
@@ -599,7 +847,7 @@ def run_tv_vs_tikhonov(
             L=pb.L,
             P=pb.P,
             tau=tau3,
-            sigma=sigma3,
+            sigma_pde=sigma3,
             prox_dual_reg=make_tv_dual_prox(lambda_tv),
         )
         x, _ = run_and_record(
@@ -1057,7 +1305,7 @@ def run_mesh_robustness_comparison(
             L=pb.L,
             P=pb.P,
             tau=tau3,
-            sigma=sigma3,
+            sigma_pde=sigma3,
             prox_dual_reg=None,
         )
         x3 = algo3.run(x0=x0, max_iterations=max_iterations)
@@ -1227,7 +1475,7 @@ def run_noise_robustness(
                 L=pb.L,
                 P=pb.P,
                 tau=tau3,
-                sigma=sigma3v,
+                sigma_pde=sigma3v,
                 prox_dual_reg=make_tikhonov_dual_prox(mu),
             )
             x_a3 = algo_a3.run(x0=x0, max_iterations=max_iterations)
@@ -1256,7 +1504,7 @@ def run_noise_robustness(
                 L=pb.L,
                 P=pb.P,
                 tau=tau3tv,
-                sigma=sigma3tv,
+                sigma_pde=sigma3tv,
                 prox_dual_reg=make_tv_dual_prox(lambda_tv),
             )
             x_a3tv = algo_a3tv.run(x0=x0, max_iterations=max_iterations)
@@ -1424,6 +1672,7 @@ def main():
             alg35=1000,
             dist=1000,
             stepsize=300,
+            block_sigma=300,
             tv=1000,
             exact_inexact=1000,
             mesh=300,
@@ -1437,6 +1686,7 @@ def main():
             alg35=30000,
             dist=10000,
             stepsize=3000,
+            block_sigma=3000,
             tv=10000,
             exact_inexact=8000,
             mesh=3000,
@@ -1460,6 +1710,9 @@ def main():
     )
     summary["stepsize"], _ = run_step_size_sensitivity(
         pb, dirs, logger, max_iterations=iters["stepsize"]
+    )
+    summary["block_sigma"], _, summary["block_norms"] = run_block_sigma_comparison(
+        pb, dirs, logger, max_iterations=iters["block_sigma"]
     )
     summary["mesh_robustness"] = run_mesh_robustness_comparison(
         dirs, logger, max_iterations=iters["mesh"]

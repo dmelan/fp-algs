@@ -370,6 +370,29 @@ class ChambollePock(FixedPointAlgorithm):
     for the group l2,inf ball projection of Eq. (27), or
     `make_tikhonov_dual_prox`).
 
+    Block dual step sizes (Eq. (34)). `L` stacks two blocks of very different
+    scales -- the PDE coupling `(A u_i - B_i m)_i`, whose norm is driven by
+    `||A|| = O(1/h^2)`, and the regularizer block `G m`, with `||G|| = O(1/h)`
+    for Total Variation -- so a single dual step `sigma` is throttled by the
+    larger one and wastes the freedom of the smaller. Following the diagonal
+    preconditioning of Pock and Chambolle (Sec. 4.7, "Choice of the step
+    sizes"), `sigma_pde` and `sigma_reg` are the two diagonal entries of the
+    block dual metric `Sigma = diag(sigma_pde I, sigma_reg I)`, under which
+    the convergence condition becomes
+
+        tau * ||Sigma^(1/2) L||^2 < 1                                (Eq. 34)
+
+    instead of the scalar `tau * sigma * ||L||^2 < 1` (Eq. 31), which is
+    recovered by leaving `sigma_reg=None` (it then defaults to `sigma_pde`).
+    Note what this does *not* buy (Sec. 4.7): `||Sigma^(1/2) L||` is still
+    bounded below by `sqrt(sigma_pde) ||A||`, so the constraint dual stays
+    capped at `sigma_pde <~ 1/(tau ||A||^2)` however the metric is balanced --
+    the ill-conditioning of the Helmholtz operator sits inside `L` and no
+    diagonal rescaling can extract it. Only the regularizer block genuinely
+    gains. `iwp.experiments.comparison.block_step_sizes_algorithm3` implements
+    the balancing recipe (per-block power iteration, then one primal/dual
+    ratio knob `gamma`).
+
     Note on notation: the report denotes the discrete-gradient/TV-dualization
     operator `D` in Sec. 4.7 (Eq. (26)) but flags a clash with the `D` used
     for the stacked measurement operator in Sec. 2-3 (see the remark opening
@@ -391,7 +414,8 @@ class ChambollePock(FixedPointAlgorithm):
         L,
         P,
         tau,
-        sigma,
+        sigma_pde,
+        sigma_reg=None,
         prox_dual_reg=None,
         logger=None,
         verbose=False,
@@ -410,7 +434,8 @@ class ChambollePock(FixedPointAlgorithm):
         self.L = L
         self.P = P
         self.tau = tau
-        self.sigma = sigma
+        self.sigma_pde = sigma_pde
+        self.sigma_reg = sigma_pde if sigma_reg is None else sigma_reg
         self.prox_dual_reg = prox_dual_reg
 
         # One-time setup: factor the Woodbury correction matrix (I + tau*C*C^*),
@@ -443,15 +468,17 @@ class ChambollePock(FixedPointAlgorithm):
             self.u_bar = [ui.copy() for ui in u]
             self.m_bar = m.copy()
 
-        # PDE dual update (parallelizable over i)
+        # PDE dual update (parallelizable over i), at the PDE block's own dual
+        # step size sigma_pde of the metric Sigma (Eq. (34)).
         for i in range(self.I):
-            self.v_pde[i] = self.v_pde[i] + self.sigma * (
+            self.v_pde[i] = self.v_pde[i] + self.sigma_pde * (
                 self.A @ self.u_bar[i] - self.B[i] @ self.m_bar
             )
-        # Regularizer dual update (TV or Tikhonov, cf. `prox_dual_reg`)
+        # Regularizer dual update (TV or Tikhonov, cf. `prox_dual_reg`), at the
+        # regularizer block's own dual step size sigma_reg.
         if self.G is not None:
             self.v_reg = self.prox_dual_reg(
-                self.v_reg + self.sigma * (self.G @ self.m_bar), self.sigma
+                self.v_reg + self.sigma_reg * (self.G @ self.m_bar), self.sigma_reg
             )
 
         # Primal update of the u_i's (parallelizable over i)
@@ -1059,6 +1086,14 @@ class DistributedChambollePock(DistributedAlgorithm):
     (verified empirically in the comparison notebook: with S=2 agents,
     passing `mu` unscaled shifts the converged m by ~1e-1 relative to the
     centralized solution, while passing `mu / S` recovers it to ~1e-5).
+
+    Block dual step sizes. As in `ChambollePock`, the PDE and regularizer
+    blocks of `L` carry their own dual step sizes `sigma_pde`/`sigma_reg`
+    (block metric `Sigma = diag(sigma_pde I, sigma_reg I)`, Eq. (34)); the
+    per-agent regularizer duals `v_reg[s]` all use `sigma_reg`, since the
+    consensus step keeps every `m_s` equal and the agents therefore see the
+    same regularizer block. Leaving `sigma_reg=None` recovers the scalar
+    metric of Eq. (31).
     """
 
     def __init__(
@@ -1076,7 +1111,8 @@ class DistributedChambollePock(DistributedAlgorithm):
         L,
         P,
         tau,
-        sigma,
+        sigma_pde,
+        sigma_reg=None,
         prox_dual_reg=None,
         agent_indices=None,
         use_mpi=False,
@@ -1110,7 +1146,8 @@ class DistributedChambollePock(DistributedAlgorithm):
         self.L = L
         self.P = P
         self.tau = tau
-        self.sigma = sigma
+        self.sigma_pde = sigma_pde
+        self.sigma_reg = sigma_pde if sigma_reg is None else sigma_reg
         self.prox_dual_reg = prox_dual_reg
 
         if self.local_agents is None:
@@ -1162,7 +1199,7 @@ class DistributedChambollePock(DistributedAlgorithm):
             local_sources = self._sources_for_agent(s)
 
             for i in local_sources:
-                self.v_pde[i] = self.v_pde[i] + self.sigma * (
+                self.v_pde[i] = self.v_pde[i] + self.sigma_pde * (
                     self.A @ self.u_bar[i] - self.B[i] @ self.m_bar
                 )
                 u_new[i] = self._prox_data(
@@ -1171,7 +1208,8 @@ class DistributedChambollePock(DistributedAlgorithm):
 
             if self.G is not None:
                 self.v_reg[s] = self.prox_dual_reg(
-                    self.v_reg[s] + self.sigma * (self.G @ self.m_bar), self.sigma
+                    self.v_reg[s] + self.sigma_reg * (self.G @ self.m_bar),
+                    self.sigma_reg,
                 )
 
             local_grad = sum(self.B_star[i] @ self.v_pde[i] for i in local_sources)

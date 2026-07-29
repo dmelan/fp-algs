@@ -346,6 +346,217 @@ def k_operator_norm_algorithm5(pb: ProblemData, G=None, n_iter=200, seed=0):
 
 
 # ---------------------------------------------------------------------------
+# Block-preconditioned dual step sizes (Eq. (34) for Algorithm 3/4, Eq. (56)
+# for Algorithm 5).
+#
+# Both dualized operators stack two blocks whose scales differ by orders of
+# magnitude, so a single scalar `sigma` is throttled by the larger of the two
+# and wastes the freedom of the smaller:
+#
+#   Algorithm 3/4:  L x = ( (A u_i - B_i m)_i , G m )   -- ||A|| = O(1/h^2)
+#                                                          vs ||G|| = O(1/h)
+#   Algorithm 5:    K x = ( (C u_i)_i         , G m )   -- ||C|| small
+#                                                          vs ||G|| = O(1/h)
+#
+# Giving each block its own dual step through the metric
+# `Sigma = diag(sigma_pde/dat I, sigma_reg I)` relaxes the convergence
+# condition from `tau sigma ||.||^2 < 1` to `tau ||Sigma^(1/2) . ||^2 < 1`.
+# The helpers below implement the recipe of Sec. 5.6 verbatim: estimate each
+# block norm *separately* by power iteration (never through the a priori
+# bounds (33)/(46), which are pessimistic), set `sigma_block = gamma /
+# ||block||^2`, then rescale `tau` so that the left-hand side of the condition
+# equals `safety` (< 1). This leaves a single scalar knob `gamma`, the
+# primal/dual step ratio, to be tuned by residual balancing.
+# ---------------------------------------------------------------------------
+
+
+def _weighted_norm(matvec, rmatvec, dim, n_iter=200, seed=0):
+    """`||Sigma^(1/2) K||`, with the weighting already folded into the two
+    callables (`matvec = Sigma^(1/2) K`, `rmatvec = K* Sigma^(1/2)`)."""
+    return power_iteration_operator_norm(
+        matvec, rmatvec, dim=dim, n_iter=n_iter, seed=seed
+    )
+
+
+def block_step_sizes_algorithm3(
+    pb: ProblemData, G=None, gamma=1.0, safety=0.9, n_iter=200, seed=0
+):
+    """Block-preconditioned `(tau, sigma_pde, sigma_reg)` for `ChambollePock`
+    / `DistributedChambollePock` (Algorithm 3/4) under the metric
+    `Sigma = diag(sigma_pde I, sigma_reg I)` and the condition (Eq. (34))
+
+        tau * ||Sigma^(1/2) L||^2 < 1.
+
+    `gamma` is the single remaining knob (the primal/dual ratio): larger
+    `gamma` means larger dual steps and, through the rescaling of `tau`, a
+    smaller primal step. `gamma = ||L||` reproduces the balanced scalar rule
+    `tau = sigma = sqrt(safety)/||L||` used elsewhere in this module, so
+    sweeping `gamma` around that value is the natural way to compare the two
+    metrics at fixed convergence margin. `G=None` disables the regularizer
+    block, in which case `sigma_reg` is returned as `None` and the result
+    reduces to the scalar rule up to the `gamma` reparametrization.
+
+    Returns a dict with the step sizes, the two block norms, the weighted
+    norm `||Sigma^(1/2) L||`, and the realized left-hand side of Eq. (34).
+    """
+    A, A_star = pb.A, pb.A_star
+    B, B_star = pb.B_list, [Bi.conj().T for Bi in pb.B_list]
+    I, L, P = pb.I, pb.L, pb.P
+    dim = I * L + P
+    G_star = G.conj().T if G is not None else None
+
+    def pde_matvec(x):
+        u = [x[i * L : (i + 1) * L] for i in range(I)]
+        m = x[I * L : I * L + P]
+        return np.concatenate([A @ u[i] - B[i] @ m for i in range(I)])
+
+    def pde_rmatvec(y):
+        v = [y[i * L : (i + 1) * L] for i in range(I)]
+        out_u = np.concatenate([A_star @ v[i] for i in range(I)])
+        out_m = -sum(B_star[i] @ v[i] for i in range(I))
+        return np.concatenate([out_u, out_m])
+
+    norm_pde = power_iteration_operator_norm(
+        pde_matvec, pde_rmatvec, dim=dim, n_iter=n_iter, seed=seed
+    )
+    sigma_pde = gamma / norm_pde**2
+
+    if G is None:
+        # Single block: ||Sigma^(1/2) L||^2 = sigma_pde ||L_pde||^2 exactly.
+        weighted_sq = sigma_pde * norm_pde**2
+        tau = safety / weighted_sq
+        return dict(
+            tau=tau,
+            sigma_pde=sigma_pde,
+            sigma_reg=None,
+            norm_pde=norm_pde,
+            norm_reg=None,
+            weighted_norm=float(np.sqrt(weighted_sq)),
+            condition_lhs=tau * weighted_sq,
+            gamma=gamma,
+        )
+
+    def reg_matvec(x):
+        return G @ x[I * L : I * L + P]
+
+    def reg_rmatvec(y):
+        return np.concatenate([np.zeros(I * L, dtype=complex), G_star @ y])
+
+    norm_reg = power_iteration_operator_norm(
+        reg_matvec, reg_rmatvec, dim=dim, n_iter=n_iter, seed=seed
+    )
+    sigma_reg = gamma / norm_reg**2
+
+    # ||Sigma^(1/2) L|| by power iteration on the *weighted* operator, rather
+    # than through the sufficient bound sigma_pde ||L_pde||^2 + sigma_reg
+    # ||L_reg||^2 (= 2 gamma here), which ignores the two blocks' interaction.
+    s_pde, s_reg = np.sqrt(sigma_pde), np.sqrt(sigma_reg)
+
+    def matvec(x):
+        return np.concatenate([s_pde * pde_matvec(x), s_reg * reg_matvec(x)])
+
+    def rmatvec(y):
+        return s_pde * pde_rmatvec(y[: I * L]) + s_reg * reg_rmatvec(y[I * L :])
+
+    weighted_norm = _weighted_norm(matvec, rmatvec, dim=dim, n_iter=n_iter, seed=seed)
+    tau = safety / weighted_norm**2
+    return dict(
+        tau=tau,
+        sigma_pde=sigma_pde,
+        sigma_reg=sigma_reg,
+        norm_pde=norm_pde,
+        norm_reg=norm_reg,
+        weighted_norm=weighted_norm,
+        condition_lhs=tau * weighted_norm**2,
+        gamma=gamma,
+    )
+
+
+def block_step_sizes_algorithm5(
+    pb: ProblemData, G=None, gamma=1.0, safety=0.9, n_iter=200, seed=0
+):
+    """Block-preconditioned `(tau, sigma_dat, sigma_reg)` for
+    `ProjectedChambollePock` (Algorithm 5) under `tau ||Sigma^(1/2) K||^2 < 1`
+    (Eq. (56)), with `K x = ((C u_i)_i, G m)` (Eq. (43)).
+
+    Same recipe and same `gamma` knob as `block_step_sizes_algorithm3`. This
+    is where per-block freedom actually pays off in full (Sec. 5.6): unlike
+    Algorithm 3, whose PDE block keeps `||A||` inside `L` however the metric
+    is balanced, here both block norms (`||C||` and `||G||`) are moderate, so
+    `sigma_dat >> sigma_reg` genuinely lets the data dual advance quickly
+    while the regularizer dual respects its `O(1/h)` Lipschitz limit.
+
+    `G=None` (or `reg_mode='tikhonov'`, for which the regularizer block is the
+    identity `P_m` -- pass `G=sp.eye(P)` to weight it separately) reduces to
+    the single-block case.
+    """
+    C, C_star = pb.C, pb.C_star
+    I, L, P, J = pb.I, pb.L, pb.P, pb.J
+    dim = I * L + P
+    G_star = G.conj().T if G is not None else None
+
+    def dat_matvec(x):
+        u = [x[i * L : (i + 1) * L] for i in range(I)]
+        return np.concatenate([C @ u[i] for i in range(I)])
+
+    def dat_rmatvec(y):
+        v = [y[i * J : (i + 1) * J] for i in range(I)]
+        out_u = np.concatenate([C_star @ v[i] for i in range(I)])
+        return np.concatenate([out_u, np.zeros(P, dtype=complex)])
+
+    norm_dat = power_iteration_operator_norm(
+        dat_matvec, dat_rmatvec, dim=dim, n_iter=n_iter, seed=seed
+    )
+    sigma_dat = gamma / norm_dat**2
+
+    if G is None:
+        weighted_sq = sigma_dat * norm_dat**2
+        tau = safety / weighted_sq
+        return dict(
+            tau=tau,
+            sigma_dat=sigma_dat,
+            sigma_reg=None,
+            norm_dat=norm_dat,
+            norm_reg=None,
+            weighted_norm=float(np.sqrt(weighted_sq)),
+            condition_lhs=tau * weighted_sq,
+            gamma=gamma,
+        )
+
+    def reg_matvec(x):
+        return G @ x[I * L : I * L + P]
+
+    def reg_rmatvec(y):
+        return np.concatenate([np.zeros(I * L, dtype=complex), G_star @ y])
+
+    norm_reg = power_iteration_operator_norm(
+        reg_matvec, reg_rmatvec, dim=dim, n_iter=n_iter, seed=seed
+    )
+    sigma_reg = gamma / norm_reg**2
+
+    s_dat, s_reg = np.sqrt(sigma_dat), np.sqrt(sigma_reg)
+
+    def matvec(x):
+        return np.concatenate([s_dat * dat_matvec(x), s_reg * reg_matvec(x)])
+
+    def rmatvec(y):
+        return s_dat * dat_rmatvec(y[: I * J]) + s_reg * reg_rmatvec(y[I * J :])
+
+    weighted_norm = _weighted_norm(matvec, rmatvec, dim=dim, n_iter=n_iter, seed=seed)
+    tau = safety / weighted_norm**2
+    return dict(
+        tau=tau,
+        sigma_dat=sigma_dat,
+        sigma_reg=sigma_reg,
+        norm_dat=norm_dat,
+        norm_reg=norm_reg,
+        weighted_norm=weighted_norm,
+        condition_lhs=tau * weighted_norm**2,
+        gamma=gamma,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Uniform run/plot/export helper, factoring the pattern repeated for every
 # algorithm across main.py / experiment.ipynb / exp_dbgd.ipynb.
 # ---------------------------------------------------------------------------
