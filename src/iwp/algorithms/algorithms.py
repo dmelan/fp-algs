@@ -557,12 +557,16 @@ class AffineConstraintProjector:
         method="smw",
         cg_eta0=None,
         cg_gamma=0.8,
+        cg_schedule="geometric",
+        cg_alpha=3.0,
         cg_min_tol=1e-8,
         cg_maxiter=200,
         logger=None,
     ):
         if method not in ("spsolve", "cached_splu", "smw", "smw_cg"):
             raise ValueError(f"Unknown projector method: {method!r}")
+        if cg_schedule not in ("geometric", "polynomial", "constant"):
+            raise ValueError(f"Unknown tolerance schedule: {cg_schedule!r}")
         self.A = A.tocsr()
         self.A_star = self.A.conj().T
         self.B = [Bi.tocsr() for Bi in B]
@@ -576,6 +580,18 @@ class AffineConstraintProjector:
         self.inner_iterations = []
         self.cg_eta0 = cg_eta0
         self.cg_gamma = cg_gamma
+        # Tolerance schedule for the inexact capacitance solve. Sec. 5.5
+        # requires a summable schedule (`sum_k k*eta_k < infinity`, Eq. (54))
+        # to preserve both convergence and the O(1/N) ergodic rate:
+        #   "geometric"  : eta_k = eta0 * gamma^k        (satisfies it for any
+        #                  gamma in (0,1); recommended in Sec. 5.6)
+        #   "polynomial" : eta_k = eta0 * (k+1)^-alpha   (satisfies it iff
+        #                  alpha > 2, the manuscript's stated condition)
+        #   "constant"   : eta_k = eta0                 (does NOT satisfy it;
+        #                  included precisely to test whether the theoretical
+        #                  requirement is visible in practice)
+        self.cg_schedule = cg_schedule
+        self.cg_alpha = cg_alpha
         # The residual-to-projection bound (Eq. 53) only needs a summable
         # tolerance schedule, not machine precision; as k grows, eta_k =
         # eta0*gamma^k decays geometrically and would otherwise eventually
@@ -678,9 +694,14 @@ class AffineConstraintProjector:
                     else max(np.linalg.norm(s), 1.0)
                 )
                 k = iteration if iteration is not None else 0
+                if self.cg_schedule == "geometric":
+                    eta_raw = eta0 * (self.cg_gamma**k)
+                elif self.cg_schedule == "polynomial":
+                    eta_raw = eta0 * (k + 1.0) ** (-self.cg_alpha)
+                else:  # "constant"
+                    eta_raw = eta0
                 eta_k = max(
-                    eta0 * (self.cg_gamma**k),
-                    self.cg_min_tol * max(np.linalg.norm(s), 1.0),
+                    eta_raw, self.cg_min_tol * max(np.linalg.norm(s), 1.0)
                 )
                 n_iter = [0]
 
@@ -734,6 +755,20 @@ class ProjectedChambollePock(FixedPointAlgorithm):
     dual step sizes for the data and regularizer blocks respectively; a
     single scalar `sigma` can be passed to both for the non-preconditioned
     variant (Eq. (33)).
+
+    `reg_mode` selects the regularizer on m, all three dualized through the
+    same second block of `K`:
+      - `"tikhonov"`  : `(mu/2)||m||_2^2`, block operator `P_m` (identity);
+      - `"tikhonov1"` : `(mu/2)||G m||_2^2`, first-order/H^1 Tikhonov, block
+                        operator `G` -- the *smooth* counterpart of TV, and
+                        the control experiment that separates "penalizing the
+                        gradient" from "penalizing it non-smoothly";
+      - `"tv"`        : `lambda_tv ||G m||_{2,1}`, block operator `G`.
+    Note that `mu` here is the weight of a *reduced* problem whose data block
+    has spectral norm `||Phi||^2 ~ 0.6`: the conditioning of the reduced
+    Hessian is `~(||Phi||^2 + mu)/mu`, so very small `mu` makes this
+    unaccelerated scheme converge extremely slowly (see the notebook's
+    Section 3.3 diagnosis).
     """
 
     def __init__(
@@ -782,6 +817,17 @@ class ProjectedChambollePock(FixedPointAlgorithm):
                 raise ValueError("reg_mode='tikhonov' requires mu")
             self.prox_reg_dual = make_tikhonov_dual_prox(mu)
             Q = P
+        elif reg_mode == "tikhonov1":
+            # First-order (H^1) Tikhonov: (mu/2)||G m||_2^2 instead of
+            # (mu/2)||m||_2^2. Same dual proximity operator as `tikhonov` --
+            # the conjugate of a quadratic is a quadratic either way -- but
+            # applied to the `G m` block rather than to `m` itself, which is
+            # the smooth counterpart of the Total Variation block and the
+            # natural control experiment against it.
+            if G is None or mu is None:
+                raise ValueError("reg_mode='tikhonov1' requires both G and mu")
+            self.prox_reg_dual = make_tikhonov_dual_prox(mu)
+            Q = G.shape[0]
         elif reg_mode == "none":
             self.prox_reg_dual = None
             Q = 0
@@ -816,7 +862,7 @@ class ProjectedChambollePock(FixedPointAlgorithm):
         ]
 
         # Dual update of the regularizer on m (TV Eq. (45) or Tikhonov).
-        if self.reg_mode == "tv":
+        if self.reg_mode in ("tv", "tikhonov1"):
             v_reg_new = self.prox_reg_dual(
                 self.v_reg + self.sigma_reg * (self.G @ m_bar), self.sigma_reg
             )
@@ -829,7 +875,7 @@ class ProjectedChambollePock(FixedPointAlgorithm):
 
         # Gradient-type step z = x - tau * K^* v (step 4, Algorithm 5).
         z_u = [u[i] - self.tau * (self.C_star @ v_dat_new[i]) for i in range(self.I)]
-        if self.reg_mode == "tv":
+        if self.reg_mode in ("tv", "tikhonov1"):
             z_m = m - self.tau * (self.G_star @ v_reg_new)
         elif self.reg_mode == "tikhonov":
             z_m = m - self.tau * v_reg_new

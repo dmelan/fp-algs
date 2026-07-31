@@ -52,6 +52,7 @@ from iwp.experiments.comparison import (
     ProblemData,  # noqa: E402
     block_step_sizes_algorithm3,
     block_step_sizes_algorithm5,
+    exact_regularized_solution,
     get_closed_form_solution_J_1,
     get_dJ_3,
     get_grad_J_2,
@@ -64,7 +65,9 @@ from iwp.experiments.comparison import (
     k_operator_norm_algorithm5,
     l_operator_norm_algorithm3,
     load_problem,
+    reduced_forward_operator,
     run_and_record,
+    run_with_tracking,
 )
 from iwp.utils.logger import setup_logger  # noqa: E402
 from iwp.utils.operators import power_iteration_operator_norm  # noqa: E402
@@ -202,7 +205,13 @@ def run_algorithm3_and_5(pb, dirs, logger, mu=1e-6, max_iterations=30000):
     f = objective_data_fidelity(pb)
     x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
 
-    l3 = l_operator_norm_algorithm3(pb, G=None)
+    # Both algorithms carry the *same* order-0 Tikhonov regularizer. Giving
+    # Algorithm 3 `G=None, prox_dual_reg=None` here (as an earlier revision
+    # did) poses it a different -- and, its reduced Hessian being rank
+    # deficient, not even uniquely solvable -- problem, which makes the two
+    # rows of the summary incomparable. See the audit in Section 3.3.
+    Id = sp.eye(pb.P, format="csr")
+    l3 = l_operator_norm_algorithm3(pb, G=Id)
     tau3 = sigma3 = 0.9 / l3
     algo3 = ChambollePock(
         exp_name="part45",
@@ -211,14 +220,14 @@ def run_algorithm3_and_5(pb, dirs, logger, mu=1e-6, max_iterations=30000):
         A=pb.A,
         B=pb.B_list,
         C=pb.C,
-        G=None,
+        G=Id,
         d=pb.d_list,
         I=pb.I,
         L=pb.L,
         P=pb.P,
         tau=tau3,
         sigma_pde=sigma3,
-        prox_dual_reg=None,
+        prox_dual_reg=make_tikhonov_dual_prox(mu),
         logger=logger,
     )
     x3, t3 = run_and_record(
@@ -309,9 +318,11 @@ def run_distributed_comparison(pb, dirs, logger, mu=1e-6, S=2, max_iterations=10
     )
     f = objective_data_fidelity(pb)
     x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
-    l3 = l_operator_norm_algorithm3(pb, G=None)
-    tau = sigma = 0.9 / l3
     Id = sp.eye(pb.P, format="csr")
+    # ||L|| must be the norm of the operator the algorithm actually dualizes,
+    # regularizer block included.
+    l3 = l_operator_norm_algorithm3(pb, G=Id)
+    tau = sigma = 0.9 / l3
 
     algo_c = ChambollePock(
         exp_name="part45",
@@ -391,6 +402,150 @@ def run_distributed_comparison(pb, dirs, logger, mu=1e-6, S=2, max_iterations=10
 
 
 # ===========================================================================
+# Section 3b: do Algorithms 3 and 5 actually solve the same problem?
+#
+# Section 2 runs them side by side and they disagree, both with each other and
+# with the C-NAGD baseline. This section isolates why, by measuring against the
+# *exact* minimizer of the reduced problem rather than against each other.
+# ===========================================================================
+
+
+def tikhonov_energy(mu, order=0, G=None):
+    """`(mu/2)||m||^2` (order 0) or `(mu/2)||G m||^2` (order 1)."""
+    if order == 0:
+        return lambda m: 0.5 * mu * float(np.vdot(m, m).real)
+    return lambda m: 0.5 * mu * float(np.linalg.norm(G @ m) ** 2)
+
+
+def tv_energy(lambda_tv, G):
+    """`lambda_tv ||G m||_{2,1}` (singleton groups, Sec. 5.2)."""
+    return lambda m: float(lambda_tv * np.sum(np.abs(G @ m)))
+
+
+def run_algorithm_3_5_diagnosis(
+    pb,
+    dirs,
+    logger,
+    mu_grid=(1e-6, 1e-4, 1e-3, 1e-2, 1e-1, 1.0),
+    budget=20000,
+    record_every=100,
+):
+    """Diagnose the Algorithm 3 vs. Algorithm 5 vs. C-NAGD disagreement.
+
+    Three questions, answered by measurement rather than by argument:
+
+    1. *Is the fixed point wrong?* We compute the exact minimizer `m*` of the
+       reduced problem in closed form (`exact_regularized_solution`) and check
+       whether the iterates approach it. They do -- so no implementation bug.
+    2. *Why so slowly?* The reduced Hessian `Phi^* Phi + mu I` has condition
+       number `(||Phi||^2 + mu)/mu`, which at the manuscript's `mu = 1e-6` is
+       ~6e5. An unaccelerated method needs `O(cond)` iterations; C-NAGD, being
+       accelerated, needs `O(sqrt(cond))`. That single number explains the
+       whole gap.
+    3. *Is it fixable?* Yes, by choosing `mu` for the algorithm rather than
+       inheriting it from the report: the sweep below trades a slightly worse
+       optimum for a dramatically reachable one.
+
+    It also records the second, more mundane cause of disagreement: as
+    configured in `run_algorithm3_and_5`, Algorithm 3 is given no regularizer
+    at all while Algorithm 5 is given Tikhonov, so the two are not even posed
+    the same problem.
+    """
+    logger.info("=== Section 3b: Algorithm 3 vs 5 vs the exact reduced minimizer ===")
+    f = objective_data_fidelity(pb)
+    x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
+    Phi = reduced_forward_operator(pb)
+    sv = np.linalg.svd(Phi, compute_uv=False)
+    logger.info(
+        f"Reduced forward operator Phi: {Phi.shape} (measurements x unknowns), "
+        f"rank {int((sv > sv[0] * 1e-12).sum())}, ||Phi||^2 = {sv[0] ** 2:.4f}"
+    )
+
+    rows = []
+    histories = {}
+    for mu in mu_grid:
+        m_star, cond = exact_regularized_solution(pb, mu, order=0, Phi=Phi)
+        k5 = k_operator_norm_algorithm5(pb, G=None)
+        algo = ProjectedChambollePock(
+            exp_name="part45",
+            algo_plot_name=f"Alg5-mu{mu:.0e}",
+            f=f,
+            C=pb.C,
+            d=pb.d_list,
+            I=pb.I,
+            L=pb.L,
+            P=pb.P,
+            tau=0.9 / k5,
+            sigma_dat=0.9 / k5,
+            sigma_reg=0.9 / k5,
+            projector=AffineConstraintProjector(pb.A, pb.B_list, method="smw"),
+            reg_mode="tikhonov",
+            mu=mu,
+        )
+        h = run_with_tracking(
+            algo,
+            x0,
+            pb,
+            pb.m,
+            max_iterations=budget,
+            record_every=record_every,
+            plateau_tol=None,  # fixed budget: we want the full trajectory
+            reference=m_star,
+            reg_energy=tikhonov_energy(mu, order=0),
+        )
+        histories[mu] = h
+        rows.append(
+            dict(
+                mu=mu,
+                cond=cond,
+                mse_exact=float(np.mean(np.abs(m_star - pb.m) ** 2)),
+                mse_reached=float(h["mse"][-1]),
+                dist_to_exact=float(h["dist_reference"][-1]),
+                rel_dist_to_exact=float(
+                    h["dist_reference"][-1] / np.linalg.norm(m_star)
+                ),
+                objective_reached=float(h["objective"][-1]),
+                iterations=budget,
+                time_s=h["wall_time"],
+            )
+        )
+        logger.info(
+            f"  mu={mu:.0e}: cond={cond:.2e}, MSE(m*)={rows[-1]['mse_exact']:.4f}, "
+            f"MSE reached={rows[-1]['mse_reached']:.4f}, "
+            f"rel. distance to m*={rows[-1]['rel_dist_to_exact']:.2e}"
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(
+        os.path.join(dirs["results"], "section3b_mu_conditioning.csv"), index=False
+    )
+
+    fig, axs = plt.subplots(1, 2, figsize=(13, 4.5))
+    for mu, h in histories.items():
+        axs[0].plot(h["iteration"], h["dist_reference"], label=f"mu={mu:.0e}")
+        axs[1].plot(h["iteration"], h["mse"], label=f"mu={mu:.0e}")
+    for ax, ylab, title in (
+        (
+            axs[0],
+            r"$\|m_k - m^\star(\mu)\|_2$",
+            "Distance to this $\\mu$'s exact minimizer",
+        ),
+        (axs[1], "MSE", "Reconstruction error"),
+    ):
+        ax.set_yscale("log")
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel(ylab)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(dirs["visuals"], "section3b_mu_conditioning.pdf"))
+    plt.close()
+
+    logger.info("mu / conditioning summary:\n" + df.to_string(index=False))
+    return df, histories
+
+
+# ===========================================================================
 # Section 4: step-size sensitivity (Eq. 31: tau*sigma*||op||^2 < 1)
 # ===========================================================================
 
@@ -406,7 +561,8 @@ def run_step_size_sensitivity(
     logger.info("=== Section 4: step-size (tau, sigma) sensitivity ===")
     f = objective_data_fidelity(pb)
     x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
-    l3 = l_operator_norm_algorithm3(pb, G=None)
+    Id = sp.eye(pb.P, format="csr")
+    l3 = l_operator_norm_algorithm3(pb, G=Id)
     k5 = k_operator_norm_algorithm5(pb, G=None)
 
     rows = []
@@ -420,14 +576,14 @@ def run_step_size_sensitivity(
             A=pb.A,
             B=pb.B_list,
             C=pb.C,
-            G=None,
+            G=Id,
             d=pb.d_list,
             I=pb.I,
             L=pb.L,
             P=pb.P,
             tau=tau3,
             sigma_pde=sigma3,
-            prox_dual_reg=None,
+            prox_dual_reg=make_tikhonov_dual_prox(mu),
         )
         try:
             x3 = algo3.run(x0=x0, max_iterations=max_iterations)
@@ -506,6 +662,257 @@ def run_step_size_sensitivity(
 
     logger.info("Step-size sensitivity summary:\n" + df.to_string(index=False))
     return df, curves
+
+
+# ===========================================================================
+# Section 4a: the three algorithms on ONE common objective, at the best step
+# size from the alpha sweep, with a plateau stopping rule.
+# ===========================================================================
+
+
+def run_common_objective_comparison(
+    pb,
+    dirs,
+    logger,
+    alpha=1.05,
+    mu=1e-3,
+    max_iterations=10000,
+    record_every=25,
+    plateau_window=1000,
+    plateau_tol=1e-3,
+    S=2,
+):
+    """Run Algorithms 3, 4 and 5 at the *same* regularizer and the same
+    step-size multiplier, and plot them against one another on a genuinely
+    comparable objective.
+
+    Two corrections to the Section 2 / Section 4 comparison, both necessary
+    before any curve can be read side by side:
+
+    1. **Same problem.** There, Algorithm 3 was constructed with `G=None,
+       prox_dual_reg=None` (no regularizer at all, hence a non-unique
+       minimizer) while Algorithm 5 carried Tikhonov `mu`. Here all three
+       algorithms get the same order-0 Tikhonov weight.
+    2. **Same objective, evaluated where it means something.** Algorithm 3
+       and 4 dualize the PDE constraint, so their iterates are infeasible and
+       their raw data-fidelity value is not comparable with Algorithm 5's
+       always-feasible one (an infeasible point can score lower than any
+       feasible point). `run_with_tracking` therefore evaluates the objective
+       at the *projection* of each iterate onto the feasible set.
+
+    The exact minimizer of the reduced problem is computed in closed form and
+    reported as a horizontal reference, so "converged" means "reached the
+    optimum", not "stopped moving".
+    """
+    logger.info("=== Section 4a: common-objective comparison at fixed alpha ===")
+    f = objective_data_fidelity(pb)
+    x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
+    Id = sp.eye(pb.P, format="csr")
+    reg_energy = tikhonov_energy(mu, order=0)
+    projector = AffineConstraintProjector(pb.A, pb.B_list, method="smw")
+
+    m_star, cond = exact_regularized_solution(pb, mu, order=0)
+    obj_star = 0.5 * sum(
+        float(
+            np.linalg.norm(
+                pb.C @ sp.linalg.spsolve(pb.A.tocsc(), pb.B_list[i] @ m_star)
+                - pb.d_list[i]
+            )
+            ** 2
+        )
+        for i in range(pb.I)
+    ) + reg_energy(m_star)
+    mse_star = float(np.mean(np.abs(m_star - pb.m) ** 2))
+    logger.info(
+        f"Exact reduced minimizer at mu={mu:.0e}: objective={obj_star:.6e}, "
+        f"MSE={mse_star:.4f}, condition number={cond:.2e}"
+    )
+
+    l3 = l_operator_norm_algorithm3(pb, G=Id)
+    k5 = k_operator_norm_algorithm5(pb, G=None)
+    agent_indices = [[i for i in range(s, pb.I, S)] for s in range(S)]
+
+    def make_alg3():
+        return ChambollePock(
+            exp_name="part45", algo_plot_name=f"Alg3-alpha{alpha}", f=f,
+            A=pb.A, B=pb.B_list, C=pb.C, G=Id, d=pb.d_list,
+            I=pb.I, L=pb.L, P=pb.P, tau=alpha / l3, sigma_pde=alpha / l3,
+            prox_dual_reg=make_tikhonov_dual_prox(mu),
+        )
+
+    def make_alg4():
+        return DistributedChambollePock(
+            exp_name="part45", algo_plot_name=f"Alg4-alpha{alpha}", f=f,
+            A=pb.A, B=pb.B_list, C=pb.C, G=Id, d=pb.d_list, S=S,
+            I=pb.I, L=pb.L, P=pb.P, tau=alpha / l3, sigma_pde=alpha / l3,
+            prox_dual_reg=make_tikhonov_dual_prox(mu / S),  # Eq. (35), see Section 3.2
+            agent_indices=agent_indices, use_mpi=False,
+        )
+
+    def make_alg5():
+        return ProjectedChambollePock(
+            exp_name="part45", algo_plot_name=f"Alg5-alpha{alpha}", f=f,
+            C=pb.C, d=pb.d_list, I=pb.I, L=pb.L, P=pb.P,
+            tau=alpha / k5, sigma_dat=alpha / k5, sigma_reg=alpha / k5,
+            projector=AffineConstraintProjector(pb.A, pb.B_list, method="smw"),
+            reg_mode="tikhonov", mu=mu,
+        )
+
+    histories, rows = {}, []
+    for name, factory, needs_projection in (
+        ("Alg3 (dualized)", make_alg3, True),
+        ("Alg4 (distributed)", make_alg4, True),
+        ("Alg5 (projected)", make_alg5, False),
+    ):
+        h = run_with_tracking(
+            factory(), x0, pb, pb.m,
+            max_iterations=max_iterations, record_every=record_every,
+            plateau_window=plateau_window, plateau_tol=plateau_tol,
+            stop_on_plateau=False,  # keep going, but record where the rule fires
+            reference=m_star, reg_energy=reg_energy,
+            projector=projector if needs_projection else None,
+        )
+        histories[name] = h
+        plateau = h["plateau_state"]
+        rows.append(
+            dict(
+                algorithm=name, alpha=alpha, mu=mu,
+                plateau_iteration=h["plateau_iteration"],
+                mse_at_plateau=plateau["mse"] if plateau else np.nan,
+                iterations=h["stop_iteration"], time_s=h["wall_time"],
+                objective=float(h["objective"][-1]),
+                objective_gap=float(h["objective"][-1] - obj_star),
+                mse=float(h["mse"][-1]),
+                mse_gap=float(h["mse"][-1] - mse_star),
+                feasibility=float(h["feasibility"][-1]),
+                dist_to_exact=float(h["dist_reference"][-1]),
+            )
+        )
+        logger.info(
+            f"  {name}: MSE plateau at {h['plateau_iteration']} "
+            f"(MSE={rows[-1]['mse_at_plateau']:.4f}), after {max_iterations} iterations "
+            f"objective={rows[-1]['objective']:.6e}, MSE={rows[-1]['mse']:.4f}"
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(
+        os.path.join(dirs["results"], "section4a_common_objective.csv"), index=False
+    )
+
+    fig, axs = plt.subplots(1, 2, figsize=(13, 4.5))
+    for j, (name, h) in enumerate(histories.items()):
+        color = f"C{j}"
+        axs[0].plot(h["iteration"], np.maximum(h["objective"] - obj_star, 1e-16),
+                    color=color, label=name)
+        axs[1].plot(h["iteration"], h["mse"], color=color, label=name)
+        if h["plateau_iteration"] is not None:
+            for ax, key in ((axs[0], None), (axs[1], "mse")):
+                k = h["plateau_iteration"]
+                idx = int(np.searchsorted(h["iteration"], k))
+                y = (max(h["objective"][idx] - obj_star, 1e-16) if key is None
+                     else h["mse"][idx])
+                ax.plot([k], [y], marker="v", color=color, ms=9, mec="k", mew=0.6,
+                        ls="none", zorder=5)
+    axs[0].set_yscale("log")
+    axs[0].set_ylabel(r"objective $-$ optimal objective")
+    axs[0].set_title(f"Optimality gap (feasible), alpha={alpha}, mu={mu:.0e}", fontsize=11)
+    axs[1].axhline(mse_star, color="k", ls=":", label=f"exact minimizer ({mse_star:.3f})")
+    axs[1].set_yscale("log")
+    axs[1].set_ylabel("MSE")
+    axs[1].set_title(f"MSE per iteration (v = plateau, tol={plateau_tol:g})", fontsize=11)
+    for ax in axs:
+        ax.set_xlabel("Iteration")
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(dirs["visuals"], "section4a_common_objective.pdf"))
+    plt.close()
+
+    logger.info("Common-objective summary:\n" + df.to_string(index=False))
+    return (
+        df,
+        histories,
+        dict(obj_star=obj_star, mse_star=mse_star, cond=cond, m_star=m_star),
+    )
+
+
+def evaluate_stopping_rules(
+    histories,
+    mse_star,
+    windows=(200, 1000, 2000),
+    tol=1e-3,
+    patiences=(1, 3),
+    step_tols=(1e-5, 1e-6, 1e-7),
+):
+    """Score candidate stopping rules against the known optimum, post hoc on
+    already-recorded trajectories (no extra solves).
+
+    Two families are compared:
+
+    - **error plateau**: fire when `|MSE_k - MSE_{k-W}| < tol` has held on
+      `patience` consecutive checks. This is the rule requested in the
+      experiment plan, and it has a structural weakness: on an ill-conditioned
+      problem the error curve has long flat shoulders followed by further
+      descent, so the rule reports convergence on the shoulder.
+    - **fixed-point step**: fire when the per-iteration movement
+      `||x_k - x_{k-1}||` falls below a threshold. This needs no ground truth
+      and, being a property of the iteration rather than of the error, does
+      not have a shoulder to trip over.
+
+    For each rule and trajectory we report where it fires, the MSE there, and
+    `mse_regret`, the MSE still recoverable by running the full budget. That
+    last column is the one that matters: it is what the rule costs.
+    """
+    rows = []
+    for name, h in histories.items():
+        it, mse, step = h["iteration"], h["mse"], h["step_norm"]
+        final_mse = float(mse[-1])
+        for W in windows:
+            for patience in patiences:
+                back = max(int(W / max(it[1] - it[0], 1)), 1)
+                fired, run = None, 0
+                for j in range(back, len(mse)):
+                    run = run + 1 if abs(mse[j] - mse[j - back]) < tol else 0
+                    if run >= patience:
+                        fired = j
+                        break
+                rows.append(
+                    dict(
+                        trajectory=name,
+                        rule=f"MSE plateau W={W}, patience={patience}",
+                        fired_at=int(it[fired]) if fired is not None else None,
+                        mse_at_stop=float(mse[fired]) if fired is not None else final_mse,
+                        mse_final=final_mse,
+                        mse_regret=(
+                            float(mse[fired] - final_mse) if fired is not None else 0.0
+                        ),
+                        gap_to_optimum=(
+                            float(mse[fired] - mse_star)
+                            if fired is not None
+                            else final_mse - mse_star
+                        ),
+                    )
+                )
+        for st in step_tols:
+            idx = np.nonzero(step < st)[0]
+            fired = int(idx[0]) if idx.size else None
+            rows.append(
+                dict(
+                    trajectory=name,
+                    rule=f"step norm < {st:g}",
+                    fired_at=int(it[fired]) if fired is not None else None,
+                    mse_at_stop=float(mse[fired]) if fired is not None else final_mse,
+                    mse_final=final_mse,
+                    mse_regret=(
+                        float(mse[fired] - final_mse) if fired is not None else 0.0
+                    ),
+                    gap_to_optimum=(
+                        float(mse[fired] - mse_star)
+                        if fired is not None
+                        else final_mse - mse_star
+                    ),
+                )
+            )
+    return pd.DataFrame(rows)
 
 
 # ===========================================================================
@@ -771,7 +1178,7 @@ def run_tv_vs_tikhonov(
     f = objective_data_fidelity(pb)
     x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
     G = pb.G
-    l3_tik = l_operator_norm_algorithm3(pb, G=None)
+    l3_tik = l_operator_norm_algorithm3(pb, G=sp.eye(pb.P, format="csr"))
     l3_tv = l_operator_norm_algorithm3(pb, G=G)
     k5_tik = k_operator_norm_algorithm5(pb, G=None)
     k5_tv = k_operator_norm_algorithm5(pb, G=G)
@@ -894,8 +1301,359 @@ def run_tv_vs_tikhonov(
 
 
 # ===========================================================================
+# Section 5b: regularizer study redone -- sweep the *weight* of each
+# regularizer rather than inheriting mu=1e-6 from the report, stop on an MSE
+# plateau rather than at an arbitrary iteration count, and add first-order
+# (H^1) Tikhonov as the smooth control for Total Variation.
+# ===========================================================================
+
+
+def _make_alg5(
+    pb, tau, sigma_dat, sigma_reg, reg_mode,
+    mu=None, lambda_tv=None, G=None, name="Alg5",
+):
+    return ProjectedChambollePock(
+        exp_name="part45", algo_plot_name=name, f=objective_data_fidelity(pb),
+        C=pb.C, d=pb.d_list, I=pb.I, L=pb.L, P=pb.P,
+        tau=tau, sigma_dat=sigma_dat, sigma_reg=sigma_reg,
+        projector=AffineConstraintProjector(pb.A, pb.B_list, method="smw"),
+        reg_mode=reg_mode, mu=mu, lambda_tv=lambda_tv, G=G,
+    )
+
+
+def run_regularizer_sweep(
+    pb,
+    dirs,
+    logger,
+    mu_grid=(1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1),
+    mu1_grid=(1e-6, 1e-5, 1e-4, 1e-3, 1e-2),
+    lambda_grid=(1e-6, 1e-5, 1e-4, 1e-3, 1e-2),
+    max_iterations=20000,
+    record_every=50,
+    plateau_window=1000,
+    plateau_tol=1e-3,
+    alpha=0.9,
+    label="",
+):
+    """Sweep the weight of each of the three regularizers on Algorithm 5.
+
+    Three changes from `run_tv_vs_tikhonov`:
+
+    - **The weight is swept, not inherited.** `mu = 1e-6` comes from the
+      internship report, where it regularizes an *accelerated* method; for the
+      unaccelerated Chambolle-Pock family it sets a reduced-Hessian condition
+      number of ~6e5 and is therefore unreachable in any sane budget (Section
+      3b). The decade grid here includes weights chosen for the algorithm.
+    - **Stopping is on an MSE plateau**, not an arbitrary iteration count, so
+      the comparison is "best reconstruction each regularizer can actually
+      deliver" rather than "state after N steps".
+    - **First-order Tikhonov** `(mu/2)||G m||^2` is included. It shares TV's
+      operator `G` but is smooth, which separates the two things TV does at
+      once: penalizing the *gradient* rather than the amplitude, and doing so
+      *non-smoothly* (edge-preserving). Comparing order-0, order-1 and TV
+      attributes the gain to the right cause.
+
+    For Tikhonov (both orders) the exact reduced minimizer is also computed,
+    so each row reports both what the weight is worth (`mse_exact`) and how
+    much of it the algorithm actually got (`mse_reached`).
+    """
+    logger.info(f"=== Section 5b: regularizer weight sweep {label} ===")
+    x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
+    G = pb.G
+    Phi = reduced_forward_operator(pb)
+    k5_id = k_operator_norm_algorithm5(pb, G=None)
+    k5_G = k_operator_norm_algorithm5(pb, G=G)
+
+    rows, histories = [], {}
+
+    def run_one(kind, weight, reg_mode, norm, reg_energy, exact_order=None):
+        tau = sigma = alpha / norm
+        algo = _make_alg5(
+            pb, tau, sigma, sigma, reg_mode,
+            mu=weight if reg_mode.startswith("tikhonov") else None,
+            lambda_tv=weight if reg_mode == "tv" else None,
+            G=G if reg_mode in ("tv", "tikhonov1") else None,
+            name=f"Alg5-{kind}-{weight:.0e}",
+        )
+        h = run_with_tracking(
+            algo, x0, pb, pb.m, max_iterations=max_iterations,
+            record_every=record_every, plateau_window=plateau_window,
+            plateau_tol=plateau_tol, reg_energy=reg_energy,
+        )
+        histories[(kind, weight)] = h
+        row = dict(
+            regularizer=kind, weight=weight,
+            stop_iteration=h["stop_iteration"], stop_reason=h["stop_reason"],
+            time_s=h["wall_time"], objective=float(h["objective"][-1]),
+            mse_reached=float(h["mse"][-1]),
+            mae=float(np.mean(np.abs(h["m_final"] - pb.m))),
+            feasibility=float(h["feasibility"][-1]),
+        )
+        if exact_order is not None:
+            m_star, cond = exact_regularized_solution(
+                pb, weight, order=exact_order, G=G, Phi=Phi
+            )
+            row["cond"] = cond
+            row["mse_exact"] = float(np.mean(np.abs(m_star - pb.m) ** 2))
+            row["rel_dist_to_exact"] = float(
+                np.linalg.norm(h["m_final"] - m_star) / np.linalg.norm(m_star)
+            )
+        rows.append(row)
+        logger.info(
+            f"  {kind} w={weight:.0e}: stop@{row['stop_iteration']} "
+            f"({row['stop_reason']}), MSE={row['mse_reached']:.4f}"
+            + (f", MSE(exact)={row['mse_exact']:.4f}, cond={row['cond']:.2e}"
+               if exact_order is not None else "")
+        )
+
+    for mu in mu_grid:
+        run_one(
+            "tikhonov0", mu, "tikhonov", k5_id, tikhonov_energy(mu, 0), exact_order=0
+        )
+    for mu in mu1_grid:
+        run_one(
+            "tikhonov1", mu, "tikhonov1", k5_G, tikhonov_energy(mu, 1, G), exact_order=1
+        )
+    for lam in lambda_grid:
+        run_one("tv", lam, "tv", k5_G, tv_energy(lam, G))
+
+    df = pd.DataFrame(rows)
+    suffix = f"_{label}" if label else ""
+    df.to_csv(
+        os.path.join(dirs["results"], f"section5b_regularizer_sweep{suffix}.csv"),
+        index=False,
+    )
+
+    fig, axs = plt.subplots(1, 2, figsize=(13, 4.5))
+    for kind, marker in (("tikhonov0", "o"), ("tikhonov1", "s"), ("tv", "^")):
+        sub = df[df.regularizer == kind].sort_values("weight")
+        if sub.empty:
+            continue
+        axs[0].plot(
+            sub.weight, sub.mse_reached, marker=marker, label=f"{kind} (reached)"
+        )
+        if "mse_exact" in sub and sub.mse_exact.notna().any():
+            axs[0].plot(sub.weight, sub.mse_exact, marker=marker, ls="--", alpha=0.5,
+                        label=f"{kind} (exact minimizer)")
+        axs[1].plot(sub.weight, sub.stop_iteration, marker=marker, label=kind)
+    axs[0].set_xscale("log")
+    axs[0].set_xlabel("Regularization weight")
+    axs[0].set_ylabel("MSE")
+    axs[0].set_title(f"Reconstruction error vs. weight {label}", fontsize=11)
+    axs[1].set_xscale("log")
+    axs[1].set_yscale("log")
+    axs[1].set_xlabel("Regularization weight")
+    axs[1].set_ylabel("Iterations to MSE plateau")
+    axs[1].set_title("Iterations needed to get there", fontsize=11)
+    for ax in axs:
+        ax.legend(fontsize=7)
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(dirs["visuals"], f"section5b_regularizer_sweep{suffix}.pdf")
+    )
+    plt.close()
+
+    logger.info(f"Regularizer sweep {label}:\n" + df.to_string(index=False))
+    return df, histories
+
+
+def run_regularizer_mesh_sweep(
+    dirs,
+    logger,
+    delta_values=(10, 20),
+    kinds=("tikhonov0", "tikhonov1", "tv"),
+    weight_grid=(1e-4, 1e-3, 1e-2),
+    max_iterations=6000,
+    record_every=50,
+    plateau_window=1000,
+    plateau_tol=1e-3,
+    alpha=0.9,
+):
+    """Repeat the regularizer comparison at several mesh densities, sweeping
+    the weight *at each density* rather than transplanting the one tuned on
+    the reference mesh.
+
+    That distinction matters: the discrete gradient `G` is an unweighted
+    incidence operator whose row count grows with the mesh (2202 -> 9561 edges
+    from delta=10 to 20) while `||G||` stays ~4.2, so the *value* of
+    `||G m||_{2,1}` grows with refinement even for the same underlying
+    contrast. A weight tuned at one density is therefore not the same
+    regularization strength at another, and comparing at fixed weight measures
+    the mis-tuning rather than the regularizer.
+    """
+    logger.info("=== Section 5c: regularizer comparison across mesh densities ===")
+    rows = []
+    for delta in delta_values:
+        path = os.path.join(SWEEP_ROOT, f"delta{delta}")
+        if not os.path.isdir(path):
+            logger.warning(f"  missing {path}, skipping delta={delta}")
+            continue
+        pb_d = load_problem(path)
+        x0 = np.zeros(pb_d.I * pb_d.L + pb_d.P, dtype=complex)
+        G = pb_d.G
+        k5_id = k_operator_norm_algorithm5(pb_d, G=None)
+        k5_G = k_operator_norm_algorithm5(pb_d, G=G)
+        for kind in kinds:
+            for weight in weight_grid:
+                reg_mode = {
+                    "tikhonov0": "tikhonov",
+                    "tikhonov1": "tikhonov1",
+                    "tv": "tv",
+                }[kind]
+                norm = k5_id if kind == "tikhonov0" else k5_G
+                energy = (
+                    tikhonov_energy(weight, 0) if kind == "tikhonov0"
+                    else tikhonov_energy(weight, 1, G) if kind == "tikhonov1"
+                    else tv_energy(weight, G)
+                )
+                algo = _make_alg5(
+                    pb_d, alpha / norm, alpha / norm, alpha / norm, reg_mode,
+                    mu=weight if kind.startswith("tikhonov") else None,
+                    lambda_tv=weight if kind == "tv" else None,
+                    G=G if kind in ("tv", "tikhonov1") else None,
+                    name=f"Alg5-{kind}-d{delta}",
+                )
+                h = run_with_tracking(
+                    algo, x0, pb_d, pb_d.m, max_iterations=max_iterations,
+                    record_every=record_every, plateau_window=plateau_window,
+                    plateau_tol=plateau_tol, reg_energy=energy,
+                )
+                rows.append(
+                    dict(
+                        delta=delta, L=pb_d.L, P=pb_d.P, Q=G.shape[0],
+                        regularizer=kind, weight=weight,
+                        stop_iteration=h["stop_iteration"],
+                        stop_reason=h["stop_reason"],
+                        time_s=h["wall_time"], mse=float(h["mse"][-1]),
+                        mae=float(np.mean(np.abs(h["m_final"] - pb_d.m))),
+                        objective=float(h["objective"][-1]),
+                        norm_C=k5_id, norm_G=float(k5_G),
+                    )
+                )
+                logger.info(
+                    f"  delta={delta} ({kind}, w={weight:.0e}): "
+                    f"MSE={rows[-1]['mse']:.4f} after "
+                    f"{rows[-1]['stop_iteration']} iterations"
+                )
+    df = pd.DataFrame(rows)
+    df.to_csv(
+        os.path.join(dirs["results"], "section5c_regularizer_mesh_sweep.csv"),
+        index=False,
+    )
+    logger.info("Regularizer x mesh sweep:\n" + df.to_string(index=False))
+    return df
+
+
+# ===========================================================================
 # Section 6: exact (SMW direct) vs inexact (matrix-free CG) projection
 # ===========================================================================
+
+
+def run_eta_schedule_comparison(
+    pb,
+    dirs,
+    logger,
+    mu=1e-3,
+    max_iterations=6000,
+    record_every=50,
+    plateau_tol=None,
+    schedules=(
+        ("exact SMW", dict(method="smw")),
+        ("geometric g=0.5", dict(method="smw_cg", cg_gamma=0.5)),
+        ("geometric g=0.9", dict(method="smw_cg", cg_gamma=0.9)),
+        ("geometric g=0.99", dict(method="smw_cg", cg_gamma=0.99)),
+        ("polynomial a=3", dict(method="smw_cg", cg_schedule="polynomial", cg_alpha=3.0)),
+        ("polynomial a=1", dict(method="smw_cg", cg_schedule="polynomial", cg_alpha=1.0)),
+        ("constant eta", dict(method="smw_cg", cg_schedule="constant")),
+    ),
+    cg_eta0=1.0,
+):
+    """Compare the exact SMW projection against inexact Krylov projections
+    under several tolerance schedules `eta_k`.
+
+    Section 5.5's guarantee needs `sum_k k*eta_k < infinity` (Eq. (54)): the
+    geometric schedules satisfy it comfortably, `polynomial alpha=3` satisfies
+    it marginally (the manuscript's `alpha > 2`), `polynomial alpha=1` does
+    *not* (`k*eta_k ~ 1` is not summable) and `constant` does not either. The
+    last two are included deliberately, to find out whether violating the
+    condition is visible at this problem size or whether it is a theoretical
+    nicety -- a question the manuscript raises but does not test.
+
+    Reported per schedule: reconstruction error, total inner CG iterations
+    (the true cost of inexactness), feasibility actually achieved, and wall
+    time against the exact backend.
+    """
+    logger.info("=== Section 6b: inexact projection under different eta_k ===")
+    x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
+    k5 = k_operator_norm_algorithm5(pb, G=None)
+    tau = sigma = 0.9 / k5
+    m_star, _ = exact_regularized_solution(pb, mu, order=0)
+
+    rows, histories = [], {}
+    for name, kwargs in schedules:
+        proj_kwargs = dict(kwargs)
+        if proj_kwargs.get("method") == "smw_cg":
+            proj_kwargs.setdefault("cg_eta0", cg_eta0)
+        projector = AffineConstraintProjector(pb.A, pb.B_list, **proj_kwargs)
+        algo = _make_alg5(
+            pb, tau, sigma, sigma, "tikhonov", mu=mu, name=f"Alg5-{name}"
+        )
+        algo.projector = projector
+        h = run_with_tracking(
+            algo, x0, pb, pb.m, max_iterations=max_iterations,
+            record_every=record_every, plateau_tol=plateau_tol,
+            reference=m_star, reg_energy=tikhonov_energy(mu, order=0),
+        )
+        histories[name] = h
+        inner = np.asarray(projector.inner_iterations, dtype=float)
+        rows.append(
+            dict(
+                schedule=name,
+                summable=name.startswith(("exact", "geometric"))
+                or name == "polynomial a=3",
+                time_s=h["wall_time"],
+                mse=float(h["mse"][-1]),
+                dist_to_exact=float(h["dist_reference"][-1]),
+                feasibility=float(h["feasibility"][-1]),
+                total_inner_cg=float(inner.sum()) if inner.size else 0.0,
+                mean_inner_cg=float(inner.mean()) if inner.size else 0.0,
+                max_inner_cg=float(inner.max()) if inner.size else 0.0,
+            )
+        )
+        logger.info(
+            f"  {name}: MSE={rows[-1]['mse']:.4f}, ||Ex||={rows[-1]['feasibility']:.2e}, "
+            f"inner CG total={rows[-1]['total_inner_cg']:.0f}, {rows[-1]['time_s']:.1f}s"
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(
+        os.path.join(dirs["results"], "section6b_eta_schedules.csv"), index=False
+    )
+
+    fig, axs = plt.subplots(1, 3, figsize=(17, 4.2))
+    for name, h in histories.items():
+        axs[0].plot(h["iteration"], h["dist_reference"], label=name)
+        axs[1].plot(h["iteration"], np.maximum(h["feasibility"], 1e-17), label=name)
+    axs[0].set_yscale("log")
+    axs[0].set_ylabel(r"$\|m_k - m^\star\|$")
+    axs[0].set_title("Accuracy vs. iteration")
+    axs[1].set_yscale("log")
+    axs[1].set_ylabel(r"$\|Ex_k\|$")
+    axs[1].set_title("Feasibility actually delivered")
+    for ax in axs[:2]:
+        ax.set_xlabel("Iteration")
+        ax.legend(fontsize=7)
+    sub = df[df.total_inner_cg > 0]
+    axs[2].barh(sub.schedule, sub.total_inner_cg, color="C0")
+    axs[2].set_xscale("log")
+    axs[2].set_xlabel("Total inner CG iterations")
+    axs[2].set_title("Cost of the inexact route")
+    plt.tight_layout()
+    plt.savefig(os.path.join(dirs["visuals"], "section6b_eta_schedules.pdf"))
+    plt.close()
+
+    logger.info("eta_k schedule comparison:\n" + df.to_string(index=False))
+    return df, histories
 
 
 def run_exact_vs_inexact_projection(
@@ -1243,6 +2001,98 @@ def run_projector_backend_sweep(
     return df_i, df_delta
 
 
+def mesh_scaling_summary(
+    dirs, logger, delta_values=(10, 20, 40), mu=1e-3, reduced_max_P=2000
+):
+    """Tabulate *what actually scales* when the mesh is refined, separating
+    the four quantities that behave completely differently.
+
+    Refining by a factor 2 in density (h -> h/2) does all of the following at
+    once, and the notebook's mesh discussion is only readable once they are
+    told apart:
+
+    - **Sizes** grow like `h^-2` in 2D: field dofs `L`, contrast dofs `P`, and
+      the number of TV edges `Q`. This is the only thing that grows fast.
+    - **The data grows only like `h^-1`**: the sensors live on the boundary,
+      so `J` scales with a curve, not an area, while `P` scales with an area.
+      The under-determination ratio `P/(I*J)` therefore grows like `h^-1`, and
+      the reconstruction problem gets harder in a statistical sense, not just
+      a computational one -- refining the contrast mesh adds unknowns faster
+      than the experiment adds measurements to constrain them.
+    - **Operator norms barely move**: `||A||`, `||C||` and `||G||` are all
+      roughly flat, because the exported matrices are not mass-normalized and
+      `G` is an unweighted incidence operator. This is why the Chambolle-Pock
+      step sizes, which depend only on norms, look mesh-robust.
+    - **Conditioning degrades like `h^-2`**: `sigma_min(A)` collapses while
+      `||A||` does not, so `kappa(A)` grows quadratically. That, not norm
+      growth, is what actually damages the dualized formulation (Eq. 57).
+
+    No algorithm is run here: this is a norms-and-sizes table, cheap enough to
+    execute inline. The reduced-problem columns are skipped above
+    `reduced_max_P` since they need a dense `A^-1 B_i`.
+    """
+    logger.info("=== Mesh scaling: what actually grows under refinement ===")
+    rows = []
+    for d in delta_values:
+        path = os.path.join(SWEEP_ROOT, f"delta{d}")
+        if not os.path.isdir(path):
+            logger.warning(f"Sweep dataset {path} not found, skipping delta={d}")
+            continue
+        pb_d = load_problem(path)
+        normA = power_iteration_operator_norm(
+            lambda v: pb_d.A @ v, lambda w: pb_d.A_star @ w, dim=pb_d.L
+        )
+        normC = power_iteration_operator_norm(
+            lambda v: pb_d.C @ v, lambda w: pb_d.C_star @ w, dim=pb_d.L
+        )
+        G, G_star = pb_d.G, pb_d.G.conj().T
+        normG = power_iteration_operator_norm(
+            lambda v: G @ v, lambda w: G_star @ w, dim=pb_d.P
+        )
+        A_lu = sp.linalg.splu(pb_d.A.tocsc())
+        sigma_min_A = 1.0 / power_iteration_operator_norm(
+            lambda v: A_lu.solve(v), lambda w: A_lu.solve(w, trans="H"), dim=pb_d.L
+        )
+        row = dict(
+            delta=d, L=pb_d.L, P=pb_d.P, Q=G.shape[0], measurements=pb_d.I * pb_d.J,
+            unknowns_per_measurement=pb_d.P / (pb_d.I * pb_d.J),
+            norm_A=normA, norm_C=normC, norm_G=normG,
+            sigma_min_A=sigma_min_A, cond_A=normA / sigma_min_A,
+        )
+        if pb_d.P <= reduced_max_P:
+            Phi = reduced_forward_operator(pb_d)
+            sv = np.linalg.svd(Phi, compute_uv=False)
+            row["norm_Phi_sq"] = float(sv[0] ** 2)
+            row["rank_Phi"] = int((sv > sv[0] * 1e-12).sum())
+            row["cond_reduced_at_mu"] = float((sv[0] ** 2 + mu) / mu)
+        rows.append(row)
+        logger.info(
+            f"  delta={d}: L={row['L']}, P={row['P']}, Q={row['Q']}, "
+            f"data={row['measurements']}, P/data={row['unknowns_per_measurement']:.1f}, "
+            f"||A||={normA:.2f}, sigma_min(A)={sigma_min_A:.4f}, cond(A)={row['cond_A']:.1f}"
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(dirs["results"], "mesh_scaling_summary.csv"), index=False)
+
+    # observed growth exponents in h (delta ~ 1/h), estimated from the ends
+    if len(df) >= 2:
+        ratio = np.log(df.delta.iloc[-1] / df.delta.iloc[0])
+        exps = {
+            col: float(np.log(df[col].iloc[-1] / df[col].iloc[0]) / ratio)
+            for col in (
+                "L", "P", "Q", "norm_A", "norm_C", "norm_G", "sigma_min_A", "cond_A",
+            )
+        }
+        logger.info(
+            "Observed exponents p in (quantity ~ delta^p ~ h^-p): "
+            + ", ".join(f"{k}: {v:+.2f}" for k, v in exps.items())
+        )
+        df.attrs["exponents"] = exps
+    logger.info("Mesh scaling summary:\n" + df.to_string(index=False))
+    return df
+
+
 def run_mesh_robustness_comparison(
     dirs,
     logger,
@@ -1288,7 +2138,8 @@ def run_mesh_robustness_comparison(
         )
         sigma_min_A = 1.0 / norm_A_inv
         cond_A = A_lu_normA / sigma_min_A
-        l3 = l_operator_norm_algorithm3(pb, G=None)
+        Id = sp.eye(pb.P, format="csr")
+        l3 = l_operator_norm_algorithm3(pb, G=Id)
         k5 = k_operator_norm_algorithm5(pb, G=None)
 
         tau3 = sigma3 = 0.9 / l3
@@ -1299,14 +2150,14 @@ def run_mesh_robustness_comparison(
             A=pb.A,
             B=pb.B_list,
             C=pb.C,
-            G=None,
+            G=Id,
             d=pb.d_list,
             I=pb.I,
             L=pb.L,
             P=pb.P,
             tau=tau3,
             sigma_pde=sigma3,
-            prox_dual_reg=None,
+            prox_dual_reg=make_tikhonov_dual_prox(mu),
         )
         x3 = algo3.run(x0=x0, max_iterations=max_iterations)
         mse3, mae3 = mse_mae(x3, pb.m, pb.P)
@@ -1388,7 +2239,7 @@ def run_noise_robustness(
     logger.info("=== Section 8: noise robustness across algorithms ===")
     rng = np.random.default_rng(seed)
     lambd, mu1 = 1e-5, 1e-7
-    l3_tik = l_operator_norm_algorithm3(pb, G=None)
+    l3_tik = l_operator_norm_algorithm3(pb, G=sp.eye(pb.P, format="csr"))
     l3_tv = l_operator_norm_algorithm3(pb, G=pb.G)
     k5_tik = k_operator_norm_algorithm5(pb, G=None)
     k5_tv = k_operator_norm_algorithm5(pb, G=pb.G)
@@ -1673,6 +2524,11 @@ def main():
             dist=1000,
             stepsize=300,
             block_sigma=300,
+            diagnosis=500,
+            common=500,
+            reg_sweep=800,
+            reg_mesh=500,
+            eta=500,
             tv=1000,
             exact_inexact=1000,
             mesh=300,
@@ -1687,6 +2543,11 @@ def main():
             dist=10000,
             stepsize=3000,
             block_sigma=3000,
+            diagnosis=20000,
+            common=10000,
+            reg_sweep=20000,
+            reg_mesh=6000,
+            eta=6000,
             tv=10000,
             exact_inexact=8000,
             mesh=3000,
@@ -1708,9 +2569,16 @@ def main():
     _, summary["distributed"] = run_distributed_comparison(
         pb, dirs, logger, max_iterations=iters["dist"]
     )
+    summary["diagnosis"], _ = run_algorithm_3_5_diagnosis(
+        pb, dirs, logger, budget=iters["diagnosis"]
+    )
     summary["stepsize"], _ = run_step_size_sensitivity(
         pb, dirs, logger, max_iterations=iters["stepsize"]
     )
+    summary["common_objective"], _, _ = run_common_objective_comparison(
+        pb, dirs, logger, max_iterations=iters["common"]
+    )
+    summary["mesh_scaling"] = mesh_scaling_summary(dirs, logger)
     summary["block_sigma"], _, summary["block_norms"] = run_block_sigma_comparison(
         pb, dirs, logger, max_iterations=iters["block_sigma"]
     )
@@ -1720,8 +2588,17 @@ def main():
     _, summary["tv_vs_tikhonov"] = run_tv_vs_tikhonov(
         pb, dirs, logger, max_iterations=iters["tv"]
     )
+    summary["regularizer_sweep"], _ = run_regularizer_sweep(
+        pb, dirs, logger, max_iterations=iters["reg_sweep"]
+    )
+    summary["regularizer_mesh"] = run_regularizer_mesh_sweep(
+        dirs, logger, max_iterations=iters["reg_mesh"]
+    )
     _, summary["exact_vs_inexact"] = run_exact_vs_inexact_projection(
         pb, dirs, logger, max_iterations=iters["exact_inexact"]
+    )
+    summary["eta_schedules"], _ = run_eta_schedule_comparison(
+        pb, dirs, logger, max_iterations=iters["eta"]
     )
     summary["projector_main"] = run_projector_backend_benchmark(pb, dirs, logger)
     summary["projector_I"], summary["projector_delta"] = run_projector_backend_sweep(

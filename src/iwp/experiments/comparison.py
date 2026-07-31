@@ -557,6 +557,222 @@ def block_step_sizes_algorithm5(
 
 
 # ---------------------------------------------------------------------------
+# Reference solutions of the *reduced* problem, and its conditioning.
+#
+# Eliminating the wave fields (u_i = A^-1 B_i m, always possible since A is
+# invertible) turns the constrained formulation (8) into an optimization in m
+# alone, driven by the reduced forward operator
+#
+#     Phi := [C A^-1 B_1 ; ... ; C A^-1 B_I]  in C^{I*J x P}.
+#
+# Every algorithm in this study -- C-NAGD on J_3, and Algorithms 3/4/5 on the
+# constrained formulation -- minimizes the same reduced objective when given
+# the same regularizer, so Phi provides a *ground truth* to test convergence
+# against instead of comparing algorithms only to each other. It also exposes
+# why that convergence is hard: Phi has at most I*J rows against P columns, so
+# the data term alone is rank deficient and the conditioning of the
+# regularized problem is set by the regularization weight.
+# ---------------------------------------------------------------------------
+
+
+def reduced_forward_operator(pb: ProblemData):
+    """Dense `Phi = [C A^-1 B_i]_i` (Eq. (8) after eliminating the fields).
+    Only tractable at the small reference sizes used for diagnostics."""
+    A_csc = pb.A.tocsc()
+    return np.vstack(
+        [pb.C @ sp.linalg.spsolve(A_csc, pb.B_list[i].toarray()) for i in range(pb.I)]
+    )
+
+
+def exact_regularized_solution(pb: ProblemData, weight, order=0, G=None, Phi=None):
+    """Closed-form minimizer of the reduced problem
+
+        min_m  (1/2)||Phi m - d||^2 + (weight/2) ||R m||^2,
+
+    with `R = I` for `order=0` (standard Tikhonov, the `mu` of `J_3`) and
+    `R = G` for `order=1` (first-order / H^1 Tikhonov, penalizing the discrete
+    gradient instead of the amplitude -- the smooth analogue of Total
+    Variation, and the natural control experiment for it).
+
+    Returns `(m_star, cond)` where `cond` is the condition number of the
+    regularized reduced Hessian, i.e. the quantity that governs how many
+    iterations an unaccelerated first-order method needs.
+    """
+    Phi = reduced_forward_operator(pb) if Phi is None else Phi
+    H0 = Phi.conj().T @ Phi
+    if order == 0:
+        R_gram = np.eye(pb.P)
+    elif order == 1:
+        if G is None:
+            raise ValueError("order=1 requires the discrete-gradient operator G")
+        G_dense = G.toarray() if sp.issparse(G) else np.asarray(G)
+        R_gram = G_dense.conj().T @ G_dense
+    else:
+        raise ValueError(f"Unsupported Tikhonov order: {order!r}")
+    H = H0 + weight * R_gram
+    d = np.concatenate(pb.d_list)
+    m_star = np.linalg.solve(H, Phi.conj().T @ d)
+    eig = np.linalg.eigvalsh(H).real
+    cond = float(eig[-1] / eig[0]) if eig[0] > 0 else np.inf
+    return m_star, cond
+
+
+# ---------------------------------------------------------------------------
+# Per-iteration tracking with a plateau-based stopping rule.
+#
+# `FixedPointAlgorithm.run` preallocates the full iterate history (which is
+# O(max_iterations * (I*L+P)) memory, ~1 GB at the 10^5-iteration budgets the
+# diagnostics below need) and stops on an algorithm-specific residual. The
+# helper here instead steps the algorithm by hand, keeps only scalar
+# diagnostics, and stops when the reconstruction error has stopped moving --
+# which is the criterion one would actually use in practice, where the
+# objective's optimal value is unknown.
+# ---------------------------------------------------------------------------
+
+
+def run_with_tracking(
+    algo,
+    x0,
+    pb: ProblemData,
+    m_true,
+    max_iterations=10000,
+    record_every=25,
+    plateau_window=1000,
+    plateau_tol=1e-3,
+    plateau_patience=1,
+    stop_on_plateau=True,
+    reference=None,
+    projector=None,
+    reg_energy=None,
+):
+    """Step `algo` up to `max_iterations`, recording scalar diagnostics every
+    `record_every` iterations, and stop early once the MSE has plateaued.
+
+    Stopping rule: `|MSE_k - MSE_{k-plateau_window}| < plateau_tol`. The window
+    is essential -- the per-iteration MSE change is O(1e-7) on this problem, so
+    the naive `|MSE_k - MSE_{k+1}| < tol` fires on the first iteration and
+    measures nothing. Set `plateau_tol=None` to disable and always run the full
+    budget. With `stop_on_plateau=False` the rule is still evaluated and the
+    firing iteration reported as `plateau_iteration`, but the run continues to
+    `max_iterations`: this is what the trajectory plots use, so that one can
+    see both where a practitioner would have stopped *and* how much accuracy
+    was still on the table.
+
+    `plateau_patience` requires the condition to hold on that many *consecutive*
+    checks before firing. This is not a cosmetic guard: an error curve on an
+    ill-conditioned problem has long flat shoulders followed by further descent,
+    and a one-shot test fires on the shoulder. Patience shortens (but cannot
+    eliminate) that failure mode -- see the stopping-rule comparison in the
+    notebook, which measures how much each rule costs against the known
+    optimum.
+
+    The history also records `step_norm`, the per-iteration fixed-point
+    movement between recording points, since it is the criterion available
+    when the optimum is *not* known and the one this study ends up
+    recommending over the error plateau.
+
+    `projector` (an `AffineConstraintProjector`) makes the recorded objective
+    comparable across formulations: Algorithm 3 dualizes the PDE constraint and
+    so passes through *infeasible* iterates, where the data term is not
+    comparable with Algorithm 5's always-feasible ones. When a projector is
+    given, the objective is evaluated at the projection of the iterate onto the
+    feasible set. `reg_energy(m) -> float` adds the regularizer to that
+    objective; `reference` (e.g. the exact minimizer) adds a `dist_reference`
+    column.
+
+    Returns a dict of numpy arrays plus the final iterate and stop reason.
+    """
+    P, L, I = pb.P, pb.L, pb.I
+    x = x0.copy()
+    keys = (
+        "iteration",
+        "mse",
+        "objective",
+        "data_fidelity",
+        "feasibility",
+        "step_norm",
+    )
+    hist = {k: [] for k in keys}
+    last_recorded = x0.copy()
+    if reference is not None:
+        hist["dist_reference"] = []
+
+    def record(k, x):
+        nonlocal last_recorded
+        m = x[-P:]
+        if not hist["iteration"]:
+            # no movement measured yet at k=0; must not read as "converged"
+            hist["step_norm"].append(np.inf)
+        else:
+            span = max(k - hist["iteration"][-1], 1)
+            hist["step_norm"].append(
+                float(np.linalg.norm(x - last_recorded) / span)
+            )
+        last_recorded = x.copy()
+        hist["iteration"].append(k)
+        hist["mse"].append(float(np.mean(np.abs(m - m_true) ** 2)))
+        hist["feasibility"].append(float(np.linalg.norm(pb.E @ x)))
+        if projector is not None:
+            u_proj, m_proj = projector.project(
+                [x[i * L : (i + 1) * L] for i in range(I)], m
+            )
+        else:
+            u_proj, m_proj = [x[i * L : (i + 1) * L] for i in range(I)], m
+        data = sum(
+            0.5 * float(np.linalg.norm(pb.C @ u_proj[i] - pb.d_list[i]) ** 2)
+            for i in range(I)
+        )
+        hist["data_fidelity"].append(data)
+        hist["objective"].append(data + (reg_energy(m_proj) if reg_energy else 0.0))
+        if reference is not None:
+            hist["dist_reference"].append(float(np.linalg.norm(m - reference)))
+
+    record(0, x)
+    stop_reason, stop_iteration = "max_iterations", max_iterations
+    plateau_iteration, plateau_state, consecutive = None, None, 0
+    t0 = time.time()
+    for k in range(1, max_iterations + 1):
+        algo.iteration = k - 1
+        x = algo.step(x)
+        if k % record_every == 0 or k == max_iterations:
+            record(k, x)
+            if (
+                plateau_tol is not None
+                and k >= plateau_window
+                and plateau_iteration is None
+            ):
+                back = plateau_window // record_every
+                flat = (
+                    len(hist["mse"]) > back
+                    and abs(hist["mse"][-1] - hist["mse"][-1 - back]) < plateau_tol
+                )
+                consecutive = consecutive + 1 if flat else 0
+                if consecutive >= plateau_patience:
+                    plateau_iteration = k
+                    plateau_state = dict(
+                        mse=hist["mse"][-1],
+                        objective=hist["objective"][-1],
+                        m=x[-P:].copy(),
+                    )
+                    if stop_on_plateau:
+                        stop_reason, stop_iteration = "mse_plateau", k
+                        break
+    wall = time.time() - t0
+    algo.iteration = stop_iteration
+    out = {k: np.asarray(v) for k, v in hist.items()}
+    out.update(
+        x_final=x,
+        m_final=x[-P:],
+        stop_reason=stop_reason,
+        stop_iteration=stop_iteration,
+        plateau_iteration=plateau_iteration,
+        plateau_state=plateau_state,
+        wall_time=wall,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Uniform run/plot/export helper, factoring the pattern repeated for every
 # algorithm across main.py / experiment.ipynb / exp_dbgd.ipynb.
 # ---------------------------------------------------------------------------
