@@ -28,7 +28,7 @@ def group_l2inf_ball_projection(v, radius, group_size=1):
     Chambolle-Pock of Sec. 4.7, Eq. (45) for the projected scheme of
     Sec. 5.2). `group_size=1` (the default) recovers plain componentwise
     l_infty clipping, which is what the group l2,1 norm reduces to for a P0
-    (piecewise-constant) contrast basis with singleton jump groups -- see the
+    (piecewise-constant) contrast basis with singleton jump groups; see the
     remark in Sec. 5.2.
     """
     v = np.asarray(v)
@@ -101,14 +101,30 @@ class FixedPointAlgorithm(abc.ABC):
     def is_converged(self, x):
         pass
 
-    def run(self, x0, max_iterations=1000):
+    def run(self, x0, max_iterations=1000, store_history=True):
+        """Run the fixed-point iteration from `x0`.
+
+        Args:
+            store_history: keep every iterate in `self.x_values` (the default,
+                which every existing caller and `plot_algorithm_convergence`
+                relies on). Set False to keep only the last iterate: the
+                preallocation costs `(max_iterations+1) * dim * 16` bytes,
+                which is 655 MB for a 3000-iteration run at delta=40, and the
+                paired proxy/FE studies only ever read the final iterate and
+                the objective trace. `self.x_values[-1]` keeps working either
+                way; `f_values` is always kept in full (it is one float per
+                iteration).
+        """
         self.max_iterations = max_iterations
+        self.store_history = store_history
         if self.logger:
             self.logger.info(
                 f"Started {self.algo_plot_name} for a maximum of {self.max_iterations} iterations."
             )
         # Preallocate arrays to not count them in memory usage
-        self.x_values = np.empty((max_iterations + 1,) + x0.shape, dtype=x0.dtype)
+        self.x_values = np.empty(
+            ((max_iterations + 1) if store_history else 1,) + x0.shape, dtype=x0.dtype
+        )
         self.f_values = np.empty(max_iterations + 1, dtype=float)
         # Start measuring time and memory
         tracemalloc.start()
@@ -120,7 +136,7 @@ class FixedPointAlgorithm(abc.ABC):
         while not self.is_converged(x) and self.iteration < self.max_iterations:
             x = self.step(x)
             self.iteration += 1
-            self.x_values[self.iteration] = x
+            self.x_values[self.iteration if store_history else 0] = x
             self.f_values[self.iteration] = self.f(x)
             if self.logger:
                 msg = f"Iteration {self.iteration}: f(x) = {self.f_values[self.iteration]:.6f}, time = {time.time() - t0:.3f}s"
@@ -129,7 +145,7 @@ class FixedPointAlgorithm(abc.ABC):
         if self.iteration == 0:
             x = self.step(x)
             self.iteration += 1
-            self.x_values[self.iteration] = x
+            self.x_values[self.iteration if store_history else 0] = x
             self.f_values[self.iteration] = self.f(x)
         self.cv_time = time.time() - t0
         _, peak = tracemalloc.get_traced_memory()
@@ -143,13 +159,23 @@ class FixedPointAlgorithm(abc.ABC):
             )
             self.logger.info(msg)
         # Cut arrays to actual size
-        self.x_values = self.x_values[: self.iteration + 1]
+        if store_history:
+            self.x_values = self.x_values[: self.iteration + 1]
         self.f_values = self.f_values[: self.iteration + 1]
         return x
 
     def plot_algorithm_convergence(
         self, m, visuals_path, add_marker=False, show=False, save=True
     ):
+        # MSE/MAE curves need the full iterate history; `run(store_history=False)`
+        # keeps only the last iterate, which would silently plot a one-point
+        # "convergence" curve. Fail loudly instead.
+        if getattr(self, "store_history", True) is False:
+            raise RuntimeError(
+                f"{self.algo_plot_name}: plot_algorithm_convergence needs the iterate "
+                "history, but run(..., store_history=False) discarded it. Re-run with "
+                "store_history=True (the default) to plot MSE/MAE per iteration."
+            )
         m_pred = (
             self.x_values[:, -m.shape[0] :]
             if self.x_values.ndim == 2
@@ -393,10 +419,26 @@ class ChambollePock(FixedPointAlgorithm):
         tau,
         sigma,
         prox_dual_reg=None,
+        accelerate="none",
+        linesearch=False,
+        mu_ls=0.7,
+        delta_ls=0.99,
+        ls_max_trials=60,
         logger=None,
         verbose=False,
     ):
         super().__init__(exp_name, algo_plot_name, f, logger=logger, verbose=verbose)
+        if accelerate != "none":
+            raise NotImplementedError(
+                "ChambollePock has no admissible acceleration schedule. Algorithm 3 "
+                "dualizes the PDE constraint and the regularizer under a *single* "
+                "scalar sigma, and the PDE block has g* = 0, which is not strongly "
+                "convex; any schedule that grows sigma for the regularizer block "
+                "grows it for the PDE block too and breaks tau*sigma*||L||^2 <= 1. "
+                "Partial acceleration needs the disjoint block structure that only "
+                "ProjectedChambollePock (Algorithm 5) has. Use linesearch=True here, "
+                "which is well defined for a scalar metric."
+            )
         self.A = A
         self.A_star = A.conj().T
         self.B = B
@@ -415,11 +457,12 @@ class ChambollePock(FixedPointAlgorithm):
 
         # One-time setup: factor the Woodbury correction matrix (I + tau*C*C^*),
         # shared across all sources since C does not depend on i, cf. Eq. (32).
-        J = C.shape[0]
-        woodbury_matrix = sp.eye(J, format="csc", dtype=complex) + tau * (
-            C @ self.C_star
-        )
-        self.woodbury_lu = sp.linalg.splu(woodbury_matrix.tocsc())
+        # It depends on tau, so the line search refactors it whenever tau
+        # moves; that is a J x J solve (J = 50 here) against the I*L-scale
+        # work of the rest of the iteration, so it is not a cost worth
+        # avoiding.
+        self._woodbury_tau = None
+        self._refactor_woodbury(tau)
 
         Q = G.shape[0] if G is not None else 0
         self.v_pde = [np.zeros(L, dtype=complex) for _ in range(I)]
@@ -428,6 +471,31 @@ class ChambollePock(FixedPointAlgorithm):
         self.m_bar = None
         self.current_residual = None
 
+        self.linesearch = bool(linesearch)
+        if not (0.0 < mu_ls < 1.0):
+            raise ValueError(f"mu_ls must lie in (0,1), got {mu_ls}")
+        if not (0.0 < delta_ls < 1.0):
+            raise ValueError(f"delta_ls must lie in (0,1), got {delta_ls}")
+        self.mu_ls = mu_ls
+        self.delta_ls = delta_ls
+        self.ls_max_trials = int(ls_max_trials)
+        self._beta_ls = sigma / tau
+        self._theta_prev = 1.0
+        self.tau_history = []
+        self.ls_trials = []
+        self.n_A_matvecs = 0
+        self.n_C_applies = 0
+
+    def _refactor_woodbury(self, tau):
+        if self._woodbury_tau == tau:
+            return
+        J = self.C.shape[0]
+        woodbury_matrix = sp.eye(J, format="csc", dtype=complex) + tau * (
+            self.C @ self.C_star
+        )
+        self.woodbury_lu = sp.linalg.splu(woodbury_matrix.tocsc())
+        self._woodbury_tau = tau
+
     def _prox_data(self, i, v):
         # (C^*C + tau^-1 I)^-1 (C^*d_i + tau^-1 v) via Sherman-Morrison-Woodbury, Eq. (31)-(32)
         rhs = self.C_star @ self.d[i] + v / self.tau
@@ -435,9 +503,112 @@ class ChambollePock(FixedPointAlgorithm):
         return self.tau * (rhs - self.tau * correction)
 
     def step(self, x):
+        return self._step_linesearch(x) if self.linesearch else self._step_plain(x)
+
+    def _grad_m(self, v_pde, v_reg):
+        grad_m = sum(self.B_star[i] @ v_pde[i] for i in range(self.I))
+        if self.G is not None:
+            grad_m = grad_m - self.G_star @ v_reg
+        return grad_m
+
+    def _step_linesearch(self, x):
+        """Malitsky-Pock Algorithm 4 on the scalar metric. The primal step
+        runs once at the previously accepted tau; only the dual update is
+        repeated. Unlike Algorithm 5, where a rejected trial costs `I` cheap
+        applications of `C`, here it costs `I` applications of `A` and `B`,
+        so the useful accounting is in `n_A_matvecs`, not iterations."""
+        L, P, I = self.L, self.P, self.I
+        m_start = I * L
+        u = [x[i * L : (i + 1) * L] for i in range(I)]
+        m = x[m_start : m_start + P]
+
+        self._refactor_woodbury(self.tau)
+        u_new = [
+            self._prox_data(i, u[i] - self.tau * (self.A_star @ self.v_pde[i]))
+            for i in range(I)
+        ]
+        self.n_A_matvecs += I
+        self.n_C_applies += 2 * I  # one C and one C^* inside each Woodbury prox
+        m_new = m + self.tau * self._grad_m(self.v_pde, self.v_reg)
+
+        tau_prev = self.tau
+        scale = np.sqrt(1.0 + self._theta_prev)
+        v_pde_new = v_reg_new = None
+        theta = 1.0
+        accepted = False
+        for trial in range(1, self.ls_max_trials + 1):
+            theta = scale
+            tau = tau_prev * scale
+            sigma = self._beta_ls * tau
+            u_bar = [u_new[i] + theta * (u_new[i] - u[i]) for i in range(I)]
+            m_bar = m_new + theta * (m_new - m)
+
+            v_pde_new = [
+                self.v_pde[i] + sigma * (self.A @ u_bar[i] - self.B[i] @ m_bar)
+                for i in range(I)
+            ]
+            self.n_A_matvecs += I
+            v_reg_new = (
+                self.prox_dual_reg(self.v_reg + sigma * (self.G @ m_bar), sigma)
+                if self.G is not None
+                else self.v_reg
+            )
+
+            dv_pde = [v_pde_new[i] - self.v_pde[i] for i in range(I)]
+            dv_reg = (
+                v_reg_new - self.v_reg if self.G is not None else np.zeros(0, dtype=complex)
+            )
+            # L^* dv = ((A^* dv_pde_i)_i, -sum_i B_i^* dv_pde_i + G^* dv_reg)
+            l_star_u = [self.A_star @ dv for dv in dv_pde]
+            self.n_A_matvecs += I
+            l_star_m = -self._grad_m(dv_pde, dv_reg)
+            lhs = tau * (
+                sum(np.linalg.norm(w) ** 2 for w in l_star_u)
+                + np.linalg.norm(l_star_m) ** 2
+            )
+            dv_sq = sum(np.linalg.norm(dv) ** 2 for dv in dv_pde) + (
+                np.linalg.norm(dv_reg) ** 2
+            )
+            rhs = (self.delta_ls**2) * dv_sq / sigma
+            if lhs <= rhs or dv_sq == 0.0:
+                accepted = True
+                break
+            scale = scale * self.mu_ls
+        self.ls_trials.append(trial)
+        if not accepted and self.logger:
+            self.logger.warning(
+                f"{self.algo_plot_name}: line search hit its trial cap "
+                f"({self.ls_max_trials}) at iteration {self.iteration}; accepting "
+                f"tau={tau_prev * theta:.4g} without the descent test."
+            )
+
+        self.tau = tau_prev * theta
+        self.sigma = self._beta_ls * self.tau
+        self._theta_prev = theta
+        self.v_pde = v_pde_new
+        self.v_reg = v_reg_new
+        self.tau_history.append(self.tau)
+
+        self.current_residual = np.sqrt(
+            sum(
+                np.linalg.norm(self.A @ u_new[i] - self.B[i] @ m_new) ** 2
+                for i in range(I)
+            )
+        )
+        self.n_A_matvecs += I
+        x_new = np.empty_like(x)
+        for i in range(I):
+            x_new[i * L : (i + 1) * L] = u_new[i]
+        x_new[m_start : m_start + P] = m_new
+        return x_new
+
+    def _step_plain(self, x):
         u = [x[i * self.L : (i + 1) * self.L] for i in range(self.I)]
         m_start = self.I * self.L
         m = x[m_start : m_start + self.P]
+        self.n_A_matvecs += 3 * self.I
+        self.n_C_applies += 2 * self.I
+        self.tau_history.append(self.tau)
 
         if self.u_bar is None:
             self.u_bar = [ui.copy() for ui in u]
@@ -500,7 +671,7 @@ class AffineConstraintProjector:
     Four interchangeable backends are offered:
 
     - "spsolve": forms `E E*` and solves `(E E*) w = E x` from scratch on
-      every call -- exactly what the original report's FISTA `prox_J_2`
+      every call, exactly what the original report's FISTA `prox_J_2`
       does (`sp.sparse.linalg.spsolve(E @ E_star, E @ x)`); the "S1" baseline
       of the experiment plan.
     - "cached_splu": same `E E*` system, but its sparse LU is factored once
@@ -547,6 +718,19 @@ class AffineConstraintProjector:
         self.logger = logger
         self.n_calls = 0
         self.inner_iterations = []
+        # Work counters, so a caller can compare algorithms at equal linear
+        # algebra budget rather than equal iteration count (Sec. 4.8). An
+        # "A-solve" is one triangular solve against the cached LU of `A` or
+        # of `A^H`; `n_A_matvecs` counts applications of the sparse `A`/`A^*`
+        # themselves, which are an order of magnitude cheaper.
+        self.n_A_solves = 0
+        self.n_A_matvecs = 0
+        # Lazily built eigendecomposition of `H = sum_i N_i^H N_i`, used only
+        # by the weighted projection below (see `project`). Building it costs
+        # one dense Hermitian eigendecomposition of a P x P matrix, after
+        # which `(c I + H)^-1` is available for *any* `c` at O(P^2), which is
+        # what makes a per-iteration-varying block metric affordable.
+        self._cap_eig = None
         self.cg_eta0 = cg_eta0
         self.cg_gamma = cg_gamma
         # The residual-to-projection bound (Eq. 53) only needs a summable
@@ -555,8 +739,8 @@ class AffineConstraintProjector:
         # demand an unreasonably (or, once it underflows, impossibly) tight
         # CG solve every single outer iteration. `cg_min_tol` floors the
         # *relative* tolerance (the report's own Eq. 54 remark: "floored at
-        # eta_k >= eps_mach ||r^k||" -- we use a looser, more practical floor
-        # by default), and `cg_maxiter` hard-caps inner iterations regardless,
+        # eta_k >= eps_mach ||r^k||", though we use a looser, more practical
+        # floor by default), and `cg_maxiter` hard-caps inner iterations regardless,
         # since S = I_P + sum_i N_i^H N_i is provably well-conditioned
         # (Sec. 5.4: S >= I_P) so CG should never need many iterations to
         # reach a sane tolerance; hitting the cap signals the schedule is
@@ -606,18 +790,65 @@ class AffineConstraintProjector:
             )
         )
 
-    def _capacitance_matvec(self, c):
-        # c -> c + sum_i N_i^H N_i c, computed via 2 triangular solves per
-        # source without ever forming N_i or S (matrix-free, Sec. 5.4 remark).
-        total = c.copy()
+    def _capacitance_matvec(self, c, shift=1.0):
+        # c -> shift*c + sum_i N_i^H N_i c, computed via 2 triangular solves
+        # per source without ever forming N_i or S (matrix-free, Sec. 5.4
+        # remark). `shift` is 1 for the unweighted projection and
+        # `tau_u / tau_m` for the block-weighted one.
+        total = shift * c
         for i in range(self.I):
             t = self.A_lu.solve(self.B[i] @ c)
             h = self.A_lu.solve(t, trans="H")
+            self.n_A_solves += 2
             total = total + self.B_star[i] @ h
         return total
 
-    def project(self, u_list, m, iteration=None):
+    def _shifted_capacitance_solve(self, s, shift):
+        """Solve `(shift * I_P + H) c = s` with `H = sum_i N_i^H N_i`, for a
+        `shift` that may change at every outer iteration.
+
+        `H` is Hermitian positive semi-definite, so one eigendecomposition
+        `H = V diag(w) V^H` (built once, on first use) turns every subsequent
+        shifted solve into `V ((V^H s) / (shift + w))`, i.e. O(P^2) instead of
+        a fresh O(P^3) factorization. That is what makes the block metric of
+        the accelerated variants free: the shift is `tau_u / tau_m` and moves
+        every iteration.
+        """
+        if self._cap_eig is None:
+            H = self.capacitance - np.eye(self.P, dtype=complex)
+            w, V = np.linalg.eigh(H)
+            # H is PSD in exact arithmetic; clip the O(eps) negative tail so a
+            # small `shift` cannot produce a spurious near-singular mode.
+            self._cap_eig = (np.maximum(w.real, 0.0), V, V.conj().T.copy())
+        w, V, V_h = self._cap_eig
+        return V @ ((V_h @ s) / (shift + w))
+
+    def project(self, u_list, m, iteration=None, weight_ratio=1.0):
+        """Project `(u_list, m)` onto `{A u_i = B_i m}`.
+
+        Args:
+            weight_ratio: `c = tau_u / tau_m`, the ratio of the primal step
+                sizes of the field block and the contrast block. `c = 1` (the
+                default) is the Euclidean projection every existing caller
+                wants, and takes exactly the code path it always took. For
+                `c != 1` this returns the projection in the metric
+                `T^-1 = diag(tau_u^-1 I, tau_m^-1 I)`, i.e.
+                `prox^T_{iota_C}(z) = z - T E^*(E T E^*)^-1 E z`, which is the
+                primal step of a Chambolle-Pock iteration carrying a *block*
+                primal metric. Two things change relative to `c = 1`: the
+                capacitance system becomes `(c I_P + H) c = s` instead of
+                `(I_P + H) c = s`, and the contrast update picks up a `1/c`.
+                Only the "smw" and "smw_cg" backends support it; the two
+                baseline backends assemble `E E^*` explicitly and would have
+                to reassemble and refactor it on every call.
+        """
         self.n_calls += 1
+        if weight_ratio != 1.0 and self.method in ("spsolve", "cached_splu"):
+            raise NotImplementedError(
+                f"AffineConstraintProjector[{self.method}]: weight_ratio != 1 needs "
+                "the SMW block structure (the capacitance shift). Use "
+                "method='smw' or 'smw_cg'."
+            )
         if self.method == "spsolve":
             EE_star = (
                 self.A_block @ self.A_block.conj().T
@@ -636,14 +867,20 @@ class AffineConstraintProjector:
             w_list = [w[i * self.L : (i + 1) * self.L] for i in range(self.I)]
         else:  # "smw" / "smw_cg"
             r_list = [self.A @ u_list[i] - self.B[i] @ m for i in range(self.I)]
+            self.n_A_matvecs += self.I
             g_list = []
             for ri in r_list:
                 t = self.A_lu.solve(ri)
                 g_list.append(self.A_lu.solve(t, trans="H"))
+                self.n_A_solves += 2
             s = sum(self.B_star[i] @ g_list[i] for i in range(self.I))
 
             if self.method == "smw":
-                c = sla.lu_solve(self.cap_lu_piv, s)
+                c = (
+                    sla.lu_solve(self.cap_lu_piv, s)
+                    if weight_ratio == 1.0
+                    else self._shifted_capacitance_solve(s, weight_ratio)
+                )
             else:  # "smw_cg": inexact capacitance solve, Sec. 5.5-5.6
                 eta0 = (
                     self.cg_eta0
@@ -661,7 +898,9 @@ class AffineConstraintProjector:
                     n_iter[0] += 1
 
                 cap_op = sp.linalg.LinearOperator(
-                    (self.P, self.P), matvec=self._capacitance_matvec, dtype=complex
+                    (self.P, self.P),
+                    matvec=lambda vec: self._capacitance_matvec(vec, weight_ratio),
+                    dtype=complex,
                 )
                 c, info = sp.linalg.cg(
                     cap_op,
@@ -682,10 +921,13 @@ class AffineConstraintProjector:
             for i in range(self.I):
                 t_prime = self.A_lu.solve(self.B[i] @ c)
                 h = self.A_lu.solve(t_prime, trans="H")
+                self.n_A_solves += 2
                 w_list.append(g_list[i] - h)
 
         u_new = [u_list[i] - self.A_star @ w_list[i] for i in range(self.I)]
-        m_new = m + sum(self.B_star[i] @ w_list[i] for i in range(self.I))
+        self.n_A_matvecs += self.I
+        correction_m = sum(self.B_star[i] @ w_list[i] for i in range(self.I))
+        m_new = m + (correction_m if weight_ratio == 1.0 else correction_m / weight_ratio)
         return u_new, m_new
 
 
@@ -696,7 +938,7 @@ class ProjectedChambollePock(FixedPointAlgorithm):
     evaluated by the closed-form (exact or inexact) affine projection of
     Sec. 5.3-5.4 through an `AffineConstraintProjector`, while the
     data-fidelity term and the regularizer on m (TV or Tikhonov) are
-    *dualized* (Eq. (43)-(45)) -- the exact reverse of Algorithm 3, where the
+    *dualized* (Eq. (43)-(45)). That is the reverse of Algorithm 3, where the
     PDE constraint is dualized and the data term is proxed. The key practical
     payoff (Sec. 5.1, 5.6) is that the step-size condition no longer involves
     `||A||`, only `||C||` and the regularizer operator's norm, making it far
@@ -707,7 +949,98 @@ class ProjectedChambollePock(FixedPointAlgorithm):
     dual step sizes for the data and regularizer blocks respectively; a
     single scalar `sigma` can be passed to both for the non-preconditioned
     variant (Eq. (33)).
+
+    Two optional accelerations sit behind flags whose defaults leave the
+    iteration exactly as it was (Sec. 4.8):
+
+    `accelerate`
+        ``"none"`` (default) is the plain scheme. ``"subspace"`` and
+        ``"dual_data"`` are the two halves of the partial acceleration of
+        Valkonen and Pock, *Acceleration of the PDHGM on strongly convex
+        subspaces* (arXiv:1511.06566), which handles objectives that are
+        strongly convex only on part of the space by giving each block its
+        own step size and accelerating only the block that earns it. What
+        makes that free here is a structural accident worth stating: the two
+        dual blocks act on *disjoint* primal variables, the data block on the
+        fields `u_i` and the regularizer block on the contrast `m`, so
+        `K^* Sigma K` is block diagonal and the step-size condition splits
+        into two independent conditions
+
+            tau_u * sigma_dat * ||C||^2 <= 1,   tau_m * sigma_reg * ||G||^2 <= 1
+
+        (the same "max, not sum" observed in `block_step_sizes_algorithm5`).
+        Either pair can therefore be rescheduled without touching the other.
+
+        ``"subspace"`` moves the Tikhonov term `(gamma/2)||m||^2` out of the
+        dual and into the primal contrast block, where it is exact, and then
+        runs the adaptive rule of Algorithm 2 of Chambolle-Pock (2011) on
+        that block alone::
+
+            theta_k     = 1 / sqrt(1 + 2 gamma tau_m,k)
+            tau_m,k+1   = theta_k tau_m,k
+            sigma_reg,k+1 = sigma_reg,k / theta_k
+
+        with the field block left at its fixed `(tau_u, sigma_dat)`. `gamma`
+        is the model's own `mu`, known exactly, never estimated. Note that
+        for `reg_mode="tikhonov"` moving the quadratic to the primal removes
+        the only dual block acting on `m`, which leaves `tau_m` out of the
+        step-size condition altogether: there is then nothing to schedule and
+        the rule is skipped (see `accel_note`), the gain coming entirely from
+        handling the strongly convex block exactly rather than through a dual
+        variable. The schedule is live only when a dual block on `m`
+        survives, i.e. TV (or first-order Tikhonov) plus a zeroth-order
+        Tikhonov term.
+
+        ``"dual_data"`` accelerates the other block. `g*_dat(v) =
+        (1/2)||v||^2 + Re<v,d>` is 1-strongly convex, so Algorithm 2 applies
+        to the *dual* of the data block: the roles of the two updates swap
+        (primal first, extrapolation carried by the dual variable) and
+
+            theta_k       = 1 / sqrt(1 + 2 gamma sigma_dat,k)
+            sigma_dat,k+1 = theta_k sigma_dat,k
+            tau_u,k+1     = tau_u,k / theta_k
+
+        with `sigma_reg` and `tau_m` held fixed, which is what keeps the
+        inexactness analysis of Sec. 5.4 (an argument about the primal
+        projection) untouched.
+
+        ``"dual_both"`` is not in the Sec. 4.8 plan; it is what measuring
+        ``"dual_data"`` pointed at. Holding `tau_m` fixed while `tau_u` grows
+        like `k` drives the metric ratio `tau_u/tau_m` up without bound, and
+        since the projection's contrast correction carries a factor
+        `tau_m/tau_u`, the contrast block freezes: the scheme is fast to
+        moderate accuracy and then stalls. The way out is not a smaller
+        schedule but the observation that under a *quadratic* regularizer
+        there is nothing partial about the strong convexity in the first
+        place. Dualizing `(mu/2)||m||^2` gives `g*_reg(v) = ||v||^2/(2 mu)`,
+        of modulus `1/mu`, alongside the data block's modulus 1, so the whole
+        of `g*` is strongly convex with modulus `gamma = min(1, 1/mu)` and
+        plain Algorithm 2 applies to both blocks at once::
+
+            theta_k = 1 / sqrt(1 + 2 gamma min(sigma_dat,k, sigma_reg,k))
+            sigma_.,k+1 = theta_k sigma_.,k,   tau_.,k+1 = tau_.,k / theta_k
+
+        Both primal steps grow together, so the metric ratio stays at 1 and
+        the projection keeps its cheap unweighted path. This is available for
+        the Tikhonov modes only: under TV, `g*_reg` is the indicator of the
+        l2,inf ball, which is not strongly convex, and the mode raises.
+
+    `linesearch`
+        Malitsky and Pock, *A first-order primal-dual algorithm with
+        linesearch*, SIAM J. Optim. 28(1):411-432, 2018 (Algorithm 4). The
+        primal step is taken first, then only the *dual* update is repeated
+        in a backtracking loop until
+
+            ||K^*(v_k - v_{k-1})||_T <= delta_ls ||v_k - v_{k-1}||_{Sigma^-1}
+
+        holds, the block-metric form of their scalar test. `||K||` is never
+        needed. A rejected trial costs one dual update, i.e. `I` applications
+        of `C`, against a primal step costing `4I` triangular solves against
+        `A`, so backtracking is cheap in the currency that actually matters
+        here.
     """
+
+    ACCELERATION_MODES = ("none", "subspace", "dual_data", "dual_both")
 
     def __init__(
         self,
@@ -727,6 +1060,14 @@ class ProjectedChambollePock(FixedPointAlgorithm):
         mu=None,
         G=None,
         lambda_tv=None,
+        accelerate="none",
+        gamma=None,
+        tau_m=None,
+        tau_max=None,
+        linesearch=False,
+        mu_ls=0.7,
+        delta_ls=0.99,
+        ls_max_trials=60,
         logger=None,
         verbose=False,
     ):
@@ -755,80 +1096,393 @@ class ProjectedChambollePock(FixedPointAlgorithm):
                 raise ValueError("reg_mode='tikhonov' requires mu")
             self.prox_reg_dual = make_tikhonov_dual_prox(mu)
             Q = P
+        elif reg_mode == "tikhonov1":
+            # First-order Tikhonov, g(m) = (mu/2)||G m||^2, dualized through
+            # G exactly as TV is. With `G = pb.G_h1` this is the discrete H^1
+            # seminorm; the dual prox is the same resolvent as the
+            # zeroth-order case, only composed with G.
+            if G is None or mu is None:
+                raise ValueError("reg_mode='tikhonov1' requires both G and mu")
+            self.prox_reg_dual = make_tikhonov_dual_prox(mu)
+            Q = G.shape[0]
         elif reg_mode == "none":
             self.prox_reg_dual = None
             Q = 0
         else:
             raise ValueError(f"Unknown reg_mode: {reg_mode!r}")
 
+        if accelerate not in self.ACCELERATION_MODES:
+            raise ValueError(
+                f"Unknown accelerate: {accelerate!r} "
+                f"(expected one of {self.ACCELERATION_MODES})"
+            )
+        self.accelerate = accelerate
+        self.linesearch = bool(linesearch)
+        if self.linesearch and accelerate in ("dual_data", "dual_both"):
+            raise ValueError(
+                "linesearch=True is incompatible with accelerate='dual_data': the "
+                "line search searches the primal step tau, while dual_data drives "
+                "tau by its own schedule. Combining them would leave neither rule's "
+                "hypotheses satisfied."
+            )
+        if not (0.0 < mu_ls < 1.0):
+            raise ValueError(f"mu_ls must lie in (0,1), got {mu_ls}")
+        if not (0.0 < delta_ls < 1.0):
+            raise ValueError(f"delta_ls must lie in (0,1), got {delta_ls}")
+        self.mu_ls = mu_ls
+        self.delta_ls = delta_ls
+        self.ls_max_trials = int(ls_max_trials)
+        # Ceiling on the primal step, i.e. a floor on the dual step. The dual
+        # schedules are unbounded by construction (sigma ~ 1/(gamma k),
+        # tau ~ k), and once tau/sigma has opened up by more than about
+        # 1/sqrt(eps_mach) the primal step x - tau K^* v is formed by
+        # cancelling two large numbers, which puts a floor under the
+        # attainable accuracy that has nothing to do with the convergence
+        # rate. Freezing the schedule once tau reaches `tau_max` keeps the
+        # early acceleration and removes the floor. None means unbounded,
+        # which is the schedule exactly as written in the papers.
+        self.tau_max = None if tau_max is None else float(tau_max)
+        self.schedule_frozen_at = None
+
+        # --- block primal steps. `tau_m=None` means "same as tau", which is
+        # the historical single-step behaviour and keeps the projection
+        # weight ratio at exactly 1.0, i.e. the untouched code path.
+        self.tau_u = tau
+        self.tau_m = tau if tau_m is None else tau_m
+        self.gamma_primal = 0.0  # modulus of the Tikhonov term kept primal
+        self.gamma_dual = 0.0  # modulus of strong convexity of g*_dat
+        self.accel_note = ""
+        self._dual_reg_active = reg_mode != "none"
+        self._schedule_live = False
+
+        if accelerate == "subspace":
+            if reg_mode == "tikhonov":
+                if gamma is not None and gamma != mu:
+                    raise ValueError(
+                        "accelerate='subspace' with reg_mode='tikhonov' moves the "
+                        f"whole Tikhonov term into the primal, so gamma must equal mu "
+                        f"({mu!r}); got {gamma!r}. Passing a different modulus would "
+                        "change the problem, not the algorithm."
+                    )
+                self.gamma_primal = float(mu)
+                # The quadratic has left the dual: no dual block acts on m.
+                self._dual_reg_active = False
+                self.accel_note = (
+                    "tikhonov: quadratic moved to the primal block, which removes the "
+                    "only dual block on m, so tau_m is unconstrained and the "
+                    "theta-schedule is vacuous (held fixed)."
+                )
+            elif reg_mode in ("tv", "tikhonov1"):
+                if gamma is None:
+                    raise ValueError(
+                        f"accelerate='subspace' with reg_mode={reg_mode!r} needs an "
+                        "explicit gamma: the m-block of "
+                        + (
+                            "a TV objective is not strongly convex"
+                            if reg_mode == "tv"
+                            else "a first-order Tikhonov objective is only strongly "
+                            "convex modulo constants"
+                        )
+                        + ", so acceleration requires an added zeroth-order Tikhonov "
+                        "term (gamma/2)||m||^2. Pass gamma to add it explicitly."
+                    )
+                self.gamma_primal = float(gamma)
+                self._schedule_live = True
+                self.accel_note = (
+                    f"{reg_mode}: added primal Tikhonov term gamma={gamma:g}; "
+                    "theta-schedule live on (tau_m, sigma_reg)."
+                )
+            else:
+                raise ValueError(
+                    "accelerate='subspace' needs a regularizer on m; got "
+                    f"reg_mode={reg_mode!r}."
+                )
+        elif accelerate == "dual_data":
+            # g*_dat(v) = (1/2)||v||^2 + Re<v,d> has modulus exactly 1.
+            self.gamma_dual = 1.0 if gamma is None else float(gamma)
+            self._schedule_live = True
+            self.accel_note = (
+                f"dual_data: theta-schedule live on (sigma_dat, tau_u), "
+                f"gamma={self.gamma_dual:g}."
+            )
+        elif accelerate == "dual_both":
+            if reg_mode == "tv":
+                raise ValueError(
+                    "accelerate='dual_both' needs every dual block to be strongly "
+                    "convex, and the TV block's conjugate is the indicator of the "
+                    "l2,inf ball, which is not. Use accelerate='dual_data' (which "
+                    "accelerates only the data block) or a Tikhonov reg_mode."
+                )
+            if gamma is not None:
+                self.gamma_dual = float(gamma)
+            elif reg_mode == "none":
+                self.gamma_dual = 1.0
+            else:
+                # min over blocks: 1 for the data block, 1/mu for the dualized
+                # quadratic. mu < 1 throughout here, so the data block binds.
+                self.gamma_dual = min(1.0, 1.0 / float(mu))
+            self._schedule_live = True
+            self.accel_note = (
+                f"dual_both: theta-schedule live on both dual blocks, "
+                f"gamma={self.gamma_dual:g}; the metric ratio stays at 1."
+            )
+
+        # Fixed dual/primal ratios, held invariant by the line search so that
+        # backtracking rescales the whole block metric rather than distorting
+        # the preconditioning it was given.
+        self._beta_dat = sigma_dat / self.tau_u
+        self._beta_reg = sigma_reg / self.tau_m
+        self._theta_prev = 1.0
+
         self.data_dual_prox = [make_data_dual_prox(d[i]) for i in range(I)]
         self.v_dat = [np.zeros(C.shape[0], dtype=complex) for _ in range(I)]
         self.v_reg = np.zeros(Q, dtype=complex)
+        self.v_bar_dat = None
+        self.v_bar_reg = None
         self.x_bar = None
         self.current_residual = None
         self.current_step_norm = None
+
+        # Reporting: step-size trajectories and work counters.
+        self.tau_u_history = []
+        self.tau_m_history = []
+        self.sigma_dat_history = []
+        self.sigma_reg_history = []
+        self.ls_trials = []
+        self.n_C_applies = 0
 
     def _split(self, x):
         u = [x[i * self.L : (i + 1) * self.L] for i in range(self.I)]
         m = x[self.I * self.L : self.I * self.L + self.P]
         return u, m
 
+    def _assemble(self, x_like, u, m):
+        out = np.empty_like(x_like)
+        for i in range(self.I):
+            out[i * self.L : (i + 1) * self.L] = u[i]
+        out[self.I * self.L : self.I * self.L + self.P] = m
+        return out
+
+    # -- the two half-steps, shared by all three iteration orderings --------
+
+    def _dual_update(self, u_bar, m_bar, sigma_dat, sigma_reg):
+        """One dual update from the stored `v_dat`/`v_reg`. Never mutates
+        state, so the line search can call it repeatedly on trial steps."""
+        v_dat_new = [
+            self.data_dual_prox[i](
+                self.v_dat[i] + sigma_dat * (self.C @ u_bar[i]), sigma_dat
+            )
+            for i in range(self.I)
+        ]
+        self.n_C_applies += self.I
+        if not self._dual_reg_active:
+            return v_dat_new, self.v_reg
+        if self.reg_mode in ("tv", "tikhonov1"):
+            v_reg_new = self.prox_reg_dual(
+                self.v_reg + sigma_reg * (self.G @ m_bar), sigma_reg
+            )
+        else:  # "tikhonov", dualized through the identity
+            v_reg_new = self.prox_reg_dual(self.v_reg + sigma_reg * m_bar, sigma_reg)
+        return v_dat_new, v_reg_new
+
+    def _primal_update(self, u, m, v_dat, v_reg):
+        """`prox^T_{tau f}(x - T K^* v)` in the block metric
+        `T = diag(tau_u I, tau_m I)`, with the Tikhonov term folded in when
+        `accelerate="subspace"` keeps it primal."""
+        z_u = [u[i] - self.tau_u * (self.C_star @ v_dat[i]) for i in range(self.I)]
+        self.n_C_applies += self.I
+        if not self._dual_reg_active:
+            z_m = m.copy()
+        elif self.reg_mode in ("tv", "tikhonov1"):
+            z_m = m - self.tau_m * (self.G_star @ v_reg)
+        else:
+            z_m = m - self.tau_m * v_reg
+        weight_ratio = self.tau_u / self.tau_m
+        if self.gamma_primal:
+            # (1/2tau_m)||m-z_m||^2 + (gamma/2)||m||^2 is, up to a constant,
+            # ((1+tau_m gamma)/2tau_m)||m - z_m/(1+tau_m gamma)||^2: the same
+            # weighted projection with a shrunk target and a rescaled metric.
+            shrink = 1.0 + self.tau_m * self.gamma_primal
+            z_m = z_m / shrink
+            weight_ratio = weight_ratio * shrink
+        return self.projector.project(
+            z_u, z_m, iteration=self.iteration, weight_ratio=weight_ratio
+        )
+
+    def _record(self):
+        self.tau_u_history.append(self.tau_u)
+        self.tau_m_history.append(self.tau_m)
+        self.sigma_dat_history.append(self.sigma_dat)
+        self.sigma_reg_history.append(self.sigma_reg)
+
+    def _finish(self, x, u_new, m_new):
+        x_new = self._assemble(x, u_new, m_new)
+        self.current_residual = self.projector.feasibility_residual_norm(u_new, m_new)
+        self.current_step_norm = np.linalg.norm(x_new - x)
+        self._record()
+        return x_new
+
+    # -- the three iteration orderings -------------------------------------
+
     def step(self, x):
+        if self.linesearch:
+            return self._step_linesearch(x)
+        if self.accelerate in ("dual_data", "dual_both"):
+            return self._step_dual_extrapolated(x)
+        return self._step_primal_extrapolated(x)
+
+    def _step_primal_extrapolated(self, x):
+        """Dual update, primal update, primal extrapolation: the original
+        Algorithm 5 ordering. With `accelerate="none"` this is bit-for-bit
+        the iteration this class has always run."""
         u, m = self._split(x)
         if self.x_bar is None:
             u_bar, m_bar = u, m
         else:
             u_bar, m_bar = self._split(self.x_bar)
 
-        # Dual update of the data term (Eq. (44)), parallelizable over i.
-        v_dat_new = [
-            self.data_dual_prox[i](
-                self.v_dat[i] + self.sigma_dat * (self.C @ u_bar[i]), self.sigma_dat
-            )
-            for i in range(self.I)
-        ]
+        v_dat_new, v_reg_new = self._dual_update(
+            u_bar, m_bar, self.sigma_dat, self.sigma_reg
+        )
+        u_new, m_new = self._primal_update(u, m, v_dat_new, v_reg_new)
 
-        # Dual update of the regularizer on m (TV Eq. (45) or Tikhonov).
-        if self.reg_mode == "tv":
-            v_reg_new = self.prox_reg_dual(
-                self.v_reg + self.sigma_reg * (self.G @ m_bar), self.sigma_reg
-            )
-        elif self.reg_mode == "tikhonov":
-            v_reg_new = self.prox_reg_dual(
-                self.v_reg + self.sigma_reg * m_bar, self.sigma_reg
-            )
-        else:
-            v_reg_new = self.v_reg
+        theta_m = 1.0
+        if self.accelerate == "subspace" and self._schedule_live:
+            theta_m = 1.0 / np.sqrt(1.0 + 2.0 * self.gamma_primal * self.tau_m)
 
-        # Gradient-type step z = x - tau * K^* v (step 4, Algorithm 5).
-        z_u = [u[i] - self.tau * (self.C_star @ v_dat_new[i]) for i in range(self.I)]
-        if self.reg_mode == "tv":
-            z_m = m - self.tau * (self.G_star @ v_reg_new)
-        elif self.reg_mode == "tikhonov":
-            z_m = m - self.tau * v_reg_new
-        else:
-            z_m = m.copy()
-
-        # Exact/inexact projection onto the affine PDE constraint (steps 5-7).
-        u_new, m_new = self.projector.project(z_u, z_m, iteration=self.iteration)
-
-        x_new = np.empty_like(x)
-        for i in range(self.I):
-            x_new[i * self.L : (i + 1) * self.L] = u_new[i]
-        x_new[self.I * self.L : self.I * self.L + self.P] = m_new
-
-        # Over-relaxation (theta = 1, step 8).
         if self.x_bar is None:
             self.x_bar = np.empty_like(x)
         for i in range(self.I):
+            # theta = 1 is written as 2a - b so the default path is
+            # bit-for-bit what it was before the flag existed.
             self.x_bar[i * self.L : (i + 1) * self.L] = 2 * u_new[i] - u[i]
-        self.x_bar[self.I * self.L : self.I * self.L + self.P] = 2 * m_new - m
+        m_slice = slice(self.I * self.L, self.I * self.L + self.P)
+        self.x_bar[m_slice] = (
+            2 * m_new - m if theta_m == 1.0 else m_new + theta_m * (m_new - m)
+        )
+
+        if theta_m != 1.0:
+            self.tau_m = self.tau_m * theta_m
+            self.sigma_reg = self.sigma_reg / theta_m
 
         self.v_dat = v_dat_new
         self.v_reg = v_reg_new
-        self.current_residual = self.projector.feasibility_residual_norm(u_new, m_new)
-        self.current_step_norm = np.linalg.norm(x_new - x)
-        return x_new
+        return self._finish(x, u_new, m_new)
+
+    def _step_dual_extrapolated(self, x):
+        """Primal update, dual update, *dual* extrapolation: Algorithm 2 of
+        Chambolle-Pock (2011) applied to the dual, which is the form that
+        exploits strong convexity of `g*` rather than of `f`."""
+        u, m = self._split(x)
+        if self.v_bar_dat is None:
+            self.v_bar_dat = [v.copy() for v in self.v_dat]
+            self.v_bar_reg = self.v_reg.copy()
+
+        u_new, m_new = self._primal_update(u, m, self.v_bar_dat, self.v_bar_reg)
+        v_dat_new, v_reg_new = self._dual_update(
+            u_new, m_new, self.sigma_dat, self.sigma_reg
+        )
+
+        both = self.accelerate == "dual_both"
+        if self.tau_max is not None and self.tau_u >= self.tau_max:
+            if self.schedule_frozen_at is None:
+                self.schedule_frozen_at = self.iteration
+                if self.logger:
+                    self.logger.info(
+                        f"{self.algo_plot_name}: step-size schedule frozen at "
+                        f"iteration {self.iteration}, tau_u={self.tau_u:.4g}"
+                    )
+            self.v_bar_dat = [2 * v_dat_new[i] - self.v_dat[i] for i in range(self.I)]
+            self.v_bar_reg = 2 * v_reg_new - self.v_reg
+            self.v_dat = v_dat_new
+            self.v_reg = v_reg_new
+            return self._finish(x, u_new, m_new)
+
+        sigma_ref = (
+            min(self.sigma_dat, self.sigma_reg)
+            if both and self._dual_reg_active
+            else self.sigma_dat
+        )
+        theta = 1.0 / np.sqrt(1.0 + 2.0 * self.gamma_dual * sigma_ref)
+        self.v_bar_dat = [
+            v_dat_new[i] + theta * (v_dat_new[i] - self.v_dat[i]) for i in range(self.I)
+        ]
+        if both:
+            self.v_bar_reg = v_reg_new + theta * (v_reg_new - self.v_reg)
+            self.sigma_reg = self.sigma_reg * theta
+            self.tau_m = self.tau_m / theta
+        else:
+            # Under "dual_data" the regularizer block is not assumed strongly
+            # convex, so it keeps theta = 1 and its steps: that asymmetry is
+            # the whole content of the partial acceleration.
+            self.v_bar_reg = 2 * v_reg_new - self.v_reg
+
+        self.sigma_dat = self.sigma_dat * theta
+        self.tau_u = self.tau_u / theta
+
+        self.v_dat = v_dat_new
+        self.v_reg = v_reg_new
+        return self._finish(x, u_new, m_new)
+
+    def _step_linesearch(self, x):
+        """Malitsky-Pock Algorithm 4. The primal step uses the step accepted
+        at the previous iteration; only the dual update is repeated."""
+        u, m = self._split(x)
+        u_new, m_new = self._primal_update(u, m, self.v_dat, self.v_reg)
+
+        tau_u_prev, tau_m_prev = self.tau_u, self.tau_m
+        scale = np.sqrt(1.0 + self._theta_prev)
+        v_dat_new = v_reg_new = None
+        theta = 1.0
+        accepted = False
+        for trial in range(1, self.ls_max_trials + 1):
+            # `theta` is the scale the trial duals were actually computed at.
+            # Keeping it separate from `scale` matters on the path where the
+            # loop runs out of trials: `scale` has been shrunk once more by
+            # then, and pairing the accepted duals with a step size they were
+            # not computed at would silently break the metric.
+            theta = scale
+            tau_u, tau_m = tau_u_prev * scale, tau_m_prev * scale
+            sigma_dat = self._beta_dat * tau_u
+            sigma_reg = self._beta_reg * tau_m
+            u_bar = [u_new[i] + theta * (u_new[i] - u[i]) for i in range(self.I)]
+            m_bar = m_new + theta * (m_new - m)
+            v_dat_new, v_reg_new = self._dual_update(u_bar, m_bar, sigma_dat, sigma_reg)
+
+            dv_dat = [v_dat_new[i] - self.v_dat[i] for i in range(self.I)]
+            lhs = tau_u * sum(
+                np.linalg.norm(self.C_star @ dv) ** 2 for dv in dv_dat
+            )
+            self.n_C_applies += self.I
+            rhs = sum(np.linalg.norm(dv) ** 2 for dv in dv_dat) / sigma_dat
+            if self._dual_reg_active:
+                dv_reg = v_reg_new - self.v_reg
+                k_star_dv_m = (
+                    self.G_star @ dv_reg
+                    if self.reg_mode in ("tv", "tikhonov1")
+                    else dv_reg
+                )
+                lhs = lhs + tau_m * np.linalg.norm(k_star_dv_m) ** 2
+                rhs = rhs + np.linalg.norm(dv_reg) ** 2 / sigma_reg
+            if lhs <= (self.delta_ls**2) * rhs or rhs == 0.0:
+                accepted = True
+                break
+            scale = scale * self.mu_ls
+        self.ls_trials.append(trial)
+        if not accepted and self.logger:
+            self.logger.warning(
+                f"{self.algo_plot_name}: line search hit its trial cap "
+                f"({self.ls_max_trials}) at iteration {self.iteration}; accepting "
+                f"tau={tau_u_prev * theta:.4g} without the descent test."
+            )
+
+        self.tau_u, self.tau_m = tau_u_prev * theta, tau_m_prev * theta
+        self.sigma_dat = self._beta_dat * self.tau_u
+        self.sigma_reg = self._beta_reg * self.tau_m
+        self._theta_prev = theta
+        self.v_dat = v_dat_new
+        self.v_reg = v_reg_new
+        return self._finish(x, u_new, m_new)
 
     def is_converged(self, x, threshold=1e-6):
         # ChambollePock/DistributedChambollePock track the (asymptotic) PDE
@@ -837,7 +1491,21 @@ class ProjectedChambollePock(FixedPointAlgorithm):
         # fixed-point step size ||x_{k+1} - x_k||, a standard practical
         # stopping rule for primal-dual algorithms without a cheap duality
         # gap (see the notebook's discussion of this choice).
-        return self.current_step_norm is not None and self.current_step_norm < threshold
+        #
+        # The two primal-first orderings (dual_data and the line search) take
+        # the primal step before the dual one, so from the standard start
+        # x0 = 0, v0 = 0 their first iterate is prox_f(x0) = x0 and the step
+        # norm is exactly zero: the rule would declare convergence before the
+        # algorithm has done anything. Skip the first step for those. The
+        # default ordering updates the dual first and never has a null first
+        # step, so its behaviour is untouched.
+        if self.current_step_norm is None:
+            return False
+        if (self.linesearch or self.accelerate in ("dual_data", "dual_both")) and (
+            self.iteration or 0
+        ) < 2:
+            return False
+        return self.current_step_norm < threshold
 
 
 ### Distributed Algorithms ###

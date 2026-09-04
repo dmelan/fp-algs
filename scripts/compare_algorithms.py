@@ -50,6 +50,8 @@ from iwp.algorithms.plot import plot_all_algorithms_convergence  # noqa: E402
 from iwp.data.load_experiment_data import load_experiment_data  # noqa: E402
 from iwp.experiments.comparison import (
     ProblemData,  # noqa: E402
+    constrained_objective,
+    exact_regularized_solution,
     get_closed_form_solution_J_1,
     get_dJ_3,
     get_grad_J_2,
@@ -62,7 +64,10 @@ from iwp.experiments.comparison import (
     k_operator_norm_algorithm5,
     l_operator_norm_algorithm3,
     load_problem,
+    make_prox_J_2_from_projector,
+    reduced_forward_operators,
     run_and_record,
+    run_with_tracking,
 )
 from iwp.utils.logger import setup_logger  # noqa: E402
 from iwp.utils.operators import power_iteration_operator_norm  # noqa: E402
@@ -382,7 +387,7 @@ def run_distributed_comparison(pb, dirs, logger, mu=1e-6, S=2, max_iterations=10
     logger.info(
         "Key finding: Eq. (35) sums the regularizer once per agent with no 1/S "
         "factor, so DistributedChambollePock must be given mu/S to reproduce "
-        "the centralized ChambollePock solution -- see l2_dist_to_centralized "
+        "the centralized ChambollePock solution; see l2_dist_to_centralized "
         "above (unscaled vs. scaled)."
     )
     return algos, df
@@ -518,7 +523,17 @@ def run_tv_vs_tikhonov(
     mu=1e-6,
     lambda_tv_grid=(1e-3, 1e-2, 1e-1, 1.0),
     max_iterations=10000,
+    tag="",
 ):
+    """Sweep `lambda_tv` for Algorithms 3 and 5 against the Tikhonov baseline.
+
+    The regularizer operator is whatever `pb.G` holds, so passing a
+    `load_problem(..., G_mode="fe_tv")` problem runs the same sweep with the
+    true finite-element jump operator; `tag` keeps the two output CSVs apart.
+    Note that the optimal `lambda_tv` is NOT transplantable between operators:
+    the `|E|` weighting changes `||G m||_1` by O(h) (a factor ~10 at
+    delta=10), so the grid must be re-swept, not reused.
+    """
     logger.info("=== Section 5: Total Variation (graph-gradient proxy) vs Tikhonov ===")
     f = objective_data_fidelity(pb)
     x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
@@ -640,7 +655,9 @@ def run_tv_vs_tikhonov(
         algos[f"Alg5-TV-lam{lambda_tv:.0e}"] = algo5_tv
 
     df = pd.DataFrame(rows)
-    df.to_csv(os.path.join(dirs["results"], "section5_tv_vs_tikhonov.csv"), index=False)
+    df.to_csv(
+        os.path.join(dirs["results"], f"section5_tv_vs_tikhonov{tag}.csv"), index=False
+    )
     logger.info("TV vs Tikhonov summary:\n" + df.to_string(index=False))
     return algos, df
 
@@ -1002,10 +1019,12 @@ def run_mesh_robustness_comparison(
     delta_values=(10, 20, 40),
     max_iterations=3000,
     sweep_root=SWEEP_ROOT,
+    G_mode="proxy",
+    tag="",
 ):
     """Run Algorithm 3 and Algorithm 5 at their theory-derived step sizes
     across mesh refinements, and report objective decrease after a *fixed*
-    iteration budget -- the direct test of Sec. 5.1's mesh-robustness claim:
+    iteration budget, the direct test of Sec. 5.1's mesh-robustness claim:
     Algorithm 3's step size shrinks as the mesh degrades (via ||A||-driven
     conditioning, Eq. 33/57), while Algorithm 5's does not (Eq. 46).
     """
@@ -1018,7 +1037,7 @@ def run_mesh_robustness_comparison(
         if not os.path.isdir(path):
             logger.warning(f"Sweep dataset {path} not found, skipping delta={d}")
             continue
-        pb = load_problem(path)
+        pb = load_problem(path, G_mode=G_mode)
         f = objective_data_fidelity(pb)
         x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
 
@@ -1116,7 +1135,7 @@ def run_mesh_robustness_comparison(
         )
     df = pd.DataFrame(rows)
     df.to_csv(
-        os.path.join(dirs["results"], "section4b_mesh_robustness.csv"), index=False
+        os.path.join(dirs["results"], f"section4b_mesh_robustness{tag}.csv"), index=False
     )
     return df
 
@@ -1136,7 +1155,11 @@ def run_noise_robustness(
     lambda_tv=1e-2,
     max_iterations=5000,
     seed=42,
+    tag="",
 ):
+    """Noise sweep. As in `run_tv_vs_tikhonov`, the TV arms use whatever
+    `pb.G` holds, so the caller selects proxy vs. FE jump operator through
+    `load_problem(..., G_mode=...)`; `tag` keeps the output CSVs apart."""
     logger.info("=== Section 8: noise robustness across algorithms ===")
     rng = np.random.default_rng(seed)
     lambd, mu1 = 1e-5, 1e-7
@@ -1336,7 +1359,8 @@ def run_noise_robustness(
 
     df = pd.DataFrame(rows)
     df.to_csv(
-        os.path.join(dirs["results"], "section8_noise_robustness_raw.csv"), index=False
+        os.path.join(dirs["results"], f"section8_noise_robustness_raw{tag}.csv"),
+        index=False,
     )
     summary = (
         df.groupby(["sigma_noise", "algorithm"])
@@ -1349,7 +1373,7 @@ def run_noise_robustness(
         .reset_index()
     )
     summary.to_csv(
-        os.path.join(dirs["results"], "section8_noise_robustness_summary.csv"),
+        os.path.join(dirs["results"], f"section8_noise_robustness_summary{tag}.csv"),
         index=False,
     )
     logger.info("Noise robustness summary:\n" + summary.to_string(index=False))
@@ -1377,7 +1401,7 @@ def run_noise_robustness(
         ax.set_ylabel(ylabel)
         ax.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(os.path.join(dirs["visuals"], "section8_noise_robustness.pdf"))
+    plt.savefig(os.path.join(dirs["visuals"], f"section8_noise_robustness{tag}.pdf"))
     plt.close()
     return df, summary
 
@@ -1429,6 +1453,8 @@ def main():
             mesh=300,
             noise=500,
             noise_samples=2,
+            accel=800,
+            accel_fp=2000,
         )
     else:
         iters = dict(
@@ -1442,6 +1468,8 @@ def main():
             mesh=3000,
             noise=3000,
             noise_samples=6,
+            accel=20000,
+            accel_fp=60000,
         )
 
     summary = {}
@@ -1474,6 +1502,15 @@ def main():
     summary["projector_I"], summary["projector_delta"] = run_projector_backend_sweep(
         dirs, logger
     )
+    _, summary["acceleration"], _, _ = run_acceleration_linesearch(
+        pb, dirs, logger, max_iterations=iters["accel"]
+    )
+    _, summary["acceleration_tv"], _ = run_acceleration_tv(
+        pb, dirs, logger, max_iterations=iters["accel"]
+    )
+    summary["acceleration_fixed_point"] = run_acceleration_fixed_point_check(
+        pb, dirs, logger, max_iterations=iters["accel_fp"]
+    )
     _, summary["noise"] = run_noise_robustness(
         pb,
         dirs,
@@ -1487,6 +1524,451 @@ def main():
             logger.info(f"--- {name} ---\n{df.to_string(index=False)}")
 
     logger.info(f"All results saved under {dirs['exp']}")
+
+
+
+
+# ===========================================================================
+# Section 10: partial acceleration and primal-dual line search (Sec. 4.8).
+#
+# The convergence audit established that Algorithms 3/4/5 reach the correct
+# minimizer and that what separates them from C-NAGD is rate, not
+# correctness. The reduced problem has conditioning kappa = (||Phi||^2+mu)/mu,
+# so an unaccelerated first-order method needs O(kappa) iterations where an
+# accelerated one needs O(sqrt(kappa)). This section measures what the two
+# remedies of Sec. 4.8 actually buy, and measures it at equal linear-algebra
+# budget rather than equal iteration count, since one C-NAGD iteration costs
+# 2I linear solves in A and A^* while one Algorithm 3 iteration only applies
+# A.
+# ===========================================================================
+
+
+def _attribute_work(fn, holder, key, per_call):
+    """Wrap `fn` so every call adds `per_call` to `holder[0].<key>`.
+
+    The primal-dual classes count their own linear algebra; the baselines
+    reach theirs through the gradient/prox callables handed to them, so the
+    counting has to be attached here instead.
+    """
+
+    def wrapped(*args, **kwargs):
+        algo = holder[0]
+        if algo is not None:
+            setattr(algo, key, getattr(algo, key, 0) + per_call)
+        return fn(*args, **kwargs)
+
+    return wrapped
+
+
+def _acceleration_row(name, family, algo, hist, hits, targets, m_true, P, extra=None):
+    row = dict(
+        algorithm=name,
+        family=family,
+        iterations=int(hist["iteration"][-1]),
+        wall_s=float(hist["time"][-1]),
+        a_solves=int(hist["a_solves"][-1]),
+        a_matvecs=int(hist["a_matvecs"][-1]),
+        c_applies=int(hist["c_applies"][-1]),
+        rel_m_final=float(hist["rel_m"][-1]),
+        rel_gap_final=float(hist["rel_gap"][-1]),
+        feasibility=float(hist["feasibility"][-1]),
+    )
+    mse, mae = mse_mae(hist.get("x_final"), m_true, P) if "x_final" in hist else (
+        np.nan,
+        np.nan,
+    )
+    row["mse"], row["mae"] = mse, mae
+    for tol in targets:
+        hit = hits.get(tol)
+        row[f"iters_to_{tol:g}"] = hit["iteration"] if hit else np.nan
+        row[f"asolves_to_{tol:g}"] = hit["a_solves"] if hit else np.nan
+        row[f"time_to_{tol:g}"] = hit["time"] if hit else np.nan
+    if extra:
+        row.update(extra)
+    return row
+
+
+def run_acceleration_linesearch(
+    pb,
+    dirs,
+    logger,
+    mu=1e-3,
+    max_iterations=20000,
+    targets=(1e-1, 3e-2, 1e-2),
+    tau_m_factors=(1.0, 10.0, 100.0),
+    tau_max_factor=10.0,
+    max_seconds=None,
+):
+    """Tikhonov arm: every acceleration variant against C-NAGD and FISTA at
+    equal work. `mu` defaults to the retuned 1e-3 rather than the historical
+    1e-6, since that is the setting where the residual gap was measured."""
+    logger.info("=== Section 10: partial acceleration and line search (Tikhonov) ===")
+    ref = exact_regularized_solution(pb, mu)
+    obj = constrained_objective(pb, mu)
+    logger.info(
+        f"Reduced problem at mu={mu:g}: ||Phi||^2={ref['phi_norm_sq']:.4f}, "
+        f"kappa={ref['kappa']:.3e}, sqrt(kappa)={np.sqrt(ref['kappa']):.1f}, "
+        f"f_opt={ref['f_opt']:.8f}"
+    )
+
+    dim = pb.I * pb.L + pb.P
+    x0 = np.zeros(dim, dtype=complex)
+    m0 = np.zeros(pb.P, dtype=complex)
+    k5 = k_operator_norm_algorithm5(pb, G=None)
+    l3 = l_operator_norm_algorithm3(pb, G=None)
+    tau5 = sigma5 = 0.9 / k5
+    tau3 = sigma3 = 0.9 / l3
+
+    def feasibility(x):
+        return float(
+            np.sqrt(
+                sum(
+                    np.linalg.norm(pb.A @ x[i * pb.L : (i + 1) * pb.L]
+                                   - pb.B_list[i] @ x[-pb.P :]) ** 2
+                    for i in range(pb.I)
+                )
+            )
+        )
+
+    # C-NAGD iterates on the contrast alone. Its objective is the same
+    # functional restricted to the feasible set, evaluated through the dense
+    # reduced operators rather than a fresh sparse solve per iteration, which
+    # would otherwise dominate its own runtime and distort the timings.
+    phis = reduced_forward_operators(pb)
+
+    def obj_reduced(m):
+        total = 0.5 * mu * np.vdot(m, m).real
+        for phi, di in zip(phis, pb.d_list):
+            r = phi @ m - di
+            total += 0.5 * np.vdot(r, r).real
+        return float(total)
+
+    def track(algo, start, iters, full_state=True):
+        return run_with_tracking(
+            algo,
+            start,
+            iters,
+            P=pb.P,
+            objective=obj if full_state else obj_reduced,
+            m_ref=ref["m"],
+            f_opt=ref["f_opt"],
+            feasibility=feasibility if full_state else None,
+            targets=targets,
+            max_seconds=max_seconds,
+            logger=logger,
+        )
+
+    rows, curves, algos = [], {}, {}
+
+    def record(name, family, algo, x, hist, hits, extra=None):
+        hist["x_final"] = x
+        curves[name] = hist
+        algos[name] = algo
+        rows.append(
+            _acceleration_row(name, family, algo, hist, hits, targets, pb.m, pb.P, extra)
+        )
+        logger.info(
+            f"{name}: {rows[-1]['iterations']} it, {rows[-1]['a_solves']} A-solves, "
+            f"rel_m={rows[-1]['rel_m_final']:.3e}, mse={rows[-1]['mse']:.4f}"
+        )
+
+    # --- baselines ---------------------------------------------------------
+    holder = [None]
+    dJ3 = _attribute_work(get_dJ_3(pb, mu), holder, "n_A_solves", 2 * pb.I)
+    cnagd = NesterovAcceleratedGradientDescent(
+        exp_name="part45", algo_plot_name="C-NAGD", f=get_J_3(pb, mu), df=dJ3,
+        K=get_K_J_3(pb, mu),
+    )
+    cnagd.n_A_solves = 0
+    holder[0] = cnagd
+    x, hist, hits = track(cnagd, m0, max_iterations, full_state=False)
+    hist["feasibility"] = np.zeros_like(hist["rel_m"])  # exact by elimination
+    record("C-NAGD", "baseline", cnagd, x, hist, hits)
+
+    # FISTA is given the SMW projector rather than the report's fresh
+    # `spsolve(E E^*, .)`, so that its prox costs the same 4I triangular
+    # solves as Algorithm 5's and the two land in the same currency. The
+    # iterates are unchanged; only the backend is.
+    fista_proj = AffineConstraintProjector(pb.A, pb.B_list, method="smw")
+    fista = FISTA(
+        exp_name="part45", algo_plot_name="FISTA", f=get_J_2(pb, mu),
+        grad=get_grad_J_2(pb, mu),
+        prox=make_prox_J_2_from_projector(pb, fista_proj), K=get_K_J_2(pb, mu),
+    )
+    fista.projector = fista_proj
+    x, hist, hits = track(fista, x0, max_iterations)
+    record("FISTA", "baseline", fista, x, hist, hits)
+
+    # --- Algorithm 3 -------------------------------------------------------
+    for label, kwargs in (("Alg3", {}), ("Alg3+linesearch", dict(linesearch=True))):
+        algo = ChambollePock(
+            exp_name="part45", algo_plot_name=label, f=obj, A=pb.A, B=pb.B_list,
+            C=pb.C, G=sp.eye(pb.P, format="csr"), d=pb.d_list, I=pb.I, L=pb.L,
+            P=pb.P, tau=tau3, sigma=sigma3,
+            prox_dual_reg=make_tikhonov_dual_prox(mu), **kwargs,
+        )
+        x, hist, hits = track(algo, x0, max_iterations)
+        extra = (
+            dict(tau_first=algo.tau_history[0], tau_last=algo.tau_history[-1],
+                 ls_trials_mean=float(np.mean(algo.ls_trials)))
+            if kwargs else dict(tau_first=tau3, tau_last=tau3, ls_trials_mean=1.0)
+        )
+        record(label, "Alg3", algo, x, hist, hits, extra)
+
+    # --- Algorithm 5 -------------------------------------------------------
+    variants = [("Alg5", {}), ("Alg5+subspace", dict(accelerate="subspace"))]
+    variants += [
+        (f"Alg5+subspace-taum{int(g)}x", dict(accelerate="subspace", tau_m=g * tau5))
+        for g in tau_m_factors
+        if g != 1.0
+    ]
+    cap = tau_max_factor * tau5
+    variants += [
+        ("Alg5+dual_data", dict(accelerate="dual_data")),
+        ("Alg5+dual_data-capped", dict(accelerate="dual_data", tau_max=cap)),
+        ("Alg5+dual_both", dict(accelerate="dual_both")),
+        ("Alg5+dual_both-capped", dict(accelerate="dual_both", tau_max=cap)),
+        ("Alg5+linesearch", dict(linesearch=True)),
+    ]
+    for label, kwargs in variants:
+        projector = AffineConstraintProjector(pb.A, pb.B_list, method="smw")
+        algo = ProjectedChambollePock(
+            exp_name="part45", algo_plot_name=label, f=obj, C=pb.C, d=pb.d_list,
+            I=pb.I, L=pb.L, P=pb.P, tau=tau5, sigma_dat=sigma5, sigma_reg=sigma5,
+            projector=projector, reg_mode="tikhonov", mu=mu, **kwargs,
+        )
+        x, hist, hits = track(algo, x0, max_iterations)
+        extra = dict(
+            tau_first=algo.tau_u_history[0], tau_last=algo.tau_u_history[-1],
+            tau_m_first=algo.tau_m_history[0], tau_m_last=algo.tau_m_history[-1],
+            sigma_dat_last=algo.sigma_dat_history[-1],
+            ls_trials_mean=float(np.mean(algo.ls_trials)) if algo.ls_trials else 1.0,
+            frozen_at=algo.schedule_frozen_at,
+            note=algo.accel_note,
+        )
+        record(label, "Alg5", algo, x, hist, hits, extra)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(
+        os.path.join(dirs["results"], "section10_acceleration_tikhonov.csv"), index=False
+    )
+    logger.info("Acceleration summary (Tikhonov):\n" + df.to_string(index=False))
+    _plot_acceleration(curves, algos, dirs, "section10_acceleration_tikhonov",
+                       f"Tikhonov, mu={mu:g}")
+    return algos, df, curves, ref
+
+
+def _plot_acceleration(curves, algos, dirs, stem, title):
+    """Three panels: accuracy per iteration, accuracy per unit of linear
+    algebra, and the accepted step-size trajectories. The middle panel is the
+    one that matters, since it is the only one in which C-NAGD and the
+    primal-dual family are paying in the same currency."""
+    fig, axs = plt.subplots(1, 3, figsize=(19, 5.2))
+    for name, hist in curves.items():
+        style = dict(lw=1.6)
+        if name in ("C-NAGD", "FISTA"):
+            style.update(ls="--", color="black" if name == "C-NAGD" else "gray")
+        axs[0].plot(hist["iteration"], hist["rel_m"], label=name, **style)
+        # Algorithm 3 never factors A: it only applies it. Plotting it on a
+        # solve-count axis would put it at zero for the whole run, which says
+        # nothing, so it is left off this panel and reported on wall time and
+        # matvecs in the table instead.
+        if hist["a_solves"][-1] > 0:
+            axs[1].plot(hist["a_solves"], hist["rel_m"], label=name, **style)
+    for ax, xlabel in zip(axs[:2], ["Iteration", "Triangular solves against A"]):
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(r"$\|m_k - m^\star\| / \|m^\star\|$")
+        ax.grid(True, which="both", alpha=0.3)
+    axs[0].set_title("Accuracy per iteration")
+    axs[1].set_title("Accuracy per A-solve (schemes that factor A)")
+    axs[0].legend(fontsize=7)
+
+    for name, algo in algos.items():
+        hist = getattr(algo, "tau_u_history", None) or getattr(algo, "tau_history", None)
+        if hist:
+            axs[2].plot(hist, label=name, lw=1.4)
+    axs[2].set_xscale("log")
+    axs[2].set_yscale("log")
+    axs[2].set_xlabel("Iteration")
+    axs[2].set_ylabel(r"accepted $\tau_k$")
+    axs[2].set_title("Primal step size")
+    axs[2].grid(True, which="both", alpha=0.3)
+    axs[2].legend(fontsize=7)
+    fig.suptitle(title)
+    plt.tight_layout(rect=[0, 0.02, 1, 0.95])
+    plt.savefig(os.path.join(dirs["visuals"], f"{stem}.pdf"))
+    plt.close()
+
+
+def run_acceleration_tv(
+    pb,
+    dirs,
+    logger,
+    lambda_tv=1e-3,
+    mu_extra=1e-3,
+    max_iterations=20000,
+    max_seconds=None,
+):
+    """TV arm. Under TV there is no closed-form minimizer, so accuracy is
+    measured against a long reference run of the unaccelerated scheme rather
+    than against an exact solution, and the headline number is iterations and
+    work to reach the reference objective.
+
+    `accelerate="subspace"` needs a strongly convex m-block, which TV alone
+    does not provide; `mu_extra` is the added Tikhonov term that supplies it,
+    so this variant solves a *different* (elastic-net-like) problem. It is
+    reported as what it is, not as a faster route to the same answer.
+    """
+    logger.info("=== Section 10b: acceleration and line search (TV) ===")
+    G = pb.G
+    k5 = k_operator_norm_algorithm5(pb, G=G)
+    tau = sigma = 0.9 / k5
+    x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
+    obj_tv = constrained_objective(pb, 0.0, lambda_tv=lambda_tv, G=G)
+
+    def build(label, **kwargs):
+        projector = AffineConstraintProjector(pb.A, pb.B_list, method="smw")
+        return ProjectedChambollePock(
+            exp_name="part45", algo_plot_name=label, f=obj_tv, C=pb.C, d=pb.d_list,
+            I=pb.I, L=pb.L, P=pb.P, tau=tau, sigma_dat=sigma, sigma_reg=sigma,
+            projector=projector, reg_mode="tv", G=G, lambda_tv=lambda_tv, **kwargs,
+        )
+
+    # Reference: the unaccelerated scheme run long, used as the target the
+    # variants are timed against.
+    reference = build("Alg5-TV-reference")
+    x_ref, hist_ref, _ = run_with_tracking(
+        reference, x0, max_iterations * 2, objective=obj_tv, logger=logger
+    )
+    m_ref = x_ref[-pb.P :]
+    logger.info(
+        f"TV reference: {hist_ref['iteration'][-1]} iterations, "
+        f"objective {hist_ref['objective'][-1]:.8f}"
+    )
+
+    targets = (1e-1, 3e-2, 1e-2)
+    rows, curves, algos = [], {}, {}
+    variants = [
+        ("Alg5-TV", {}),
+        ("Alg5-TV+linesearch", dict(linesearch=True)),
+        ("Alg5-TV+subspace", dict(accelerate="subspace", gamma=mu_extra)),
+        ("Alg5-TV+dual_data", dict(accelerate="dual_data")),
+        ("Alg5-TV+dual_data-capped",
+         dict(accelerate="dual_data", tau_max=10.0 * tau)),
+    ]
+    for label, kwargs in variants:
+        algo = build(label, **kwargs)
+        x, hist, hits = run_with_tracking(
+            algo, x0, max_iterations, objective=obj_tv, m_ref=m_ref,
+            f_opt=hist_ref["objective"][-1], targets=targets,
+            max_seconds=max_seconds, logger=logger,
+        )
+        hist["x_final"] = x
+        curves[label] = hist
+        algos[label] = algo
+        extra = dict(
+            tau_first=algo.tau_u_history[0], tau_last=algo.tau_u_history[-1],
+            ls_trials_mean=float(np.mean(algo.ls_trials)) if algo.ls_trials else 1.0,
+            note=algo.accel_note,
+            solves_a_different_problem=bool(kwargs.get("accelerate") == "subspace"),
+        )
+        rows.append(
+            _acceleration_row(label, "Alg5-TV", algo, hist, hits, targets, pb.m, pb.P,
+                              extra)
+        )
+        logger.info(
+            f"{label}: {rows[-1]['iterations']} it, {rows[-1]['a_solves']} A-solves, "
+            f"mse={rows[-1]['mse']:.4f}, obj={hist['objective'][-1]:.6f}"
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(dirs["results"], "section10b_acceleration_tv.csv"),
+              index=False)
+    logger.info("Acceleration summary (TV):\n" + df.to_string(index=False))
+    _plot_acceleration(curves, algos, dirs, "section10b_acceleration_tv",
+                       f"TV, lambda={lambda_tv:g}")
+    return algos, df, curves
+
+
+def run_acceleration_fixed_point_check(
+    pb, dirs, logger, mu=1e-3, mu_grid=(1e-1, 1e-2, 1e-3), max_iterations=60000,
+    tol=1e-9, stop_threshold=1e-13
+):
+    """Acceptance check: every accelerated variant must reach the *same* fixed
+    point as the unaccelerated scheme, not merely a nearby one.
+
+    Accuracy is measured against the closed-form minimizer of the reduced
+    Tikhonov problem, which no algorithm here has any hand in, so this also
+    rules out the possibility that the variants agree on a common wrong
+    answer.
+
+    The check is run across `mu_grid` for a reason worth stating rather than
+    hiding: at `mu = 1e-3` the unaccelerated scheme does not itself get within
+    1e-9 of the minimizer inside any affordable budget (that slowness is the
+    whole subject of this section), so an agreement threshold of 1e-9 is only
+    meaningful at the better-conditioned weights. Reporting the whole grid
+    shows the agreement tightening as the reference run actually converges,
+    which is the honest form of the claim.
+    """
+    logger.info("=== Section 10c: accelerated variants reach the same fixed point ===")
+    x0 = np.zeros(pb.I * pb.L + pb.P, dtype=complex)
+    k5 = k_operator_norm_algorithm5(pb, G=None)
+    tau = sigma = 0.9 / k5
+    variants = (
+        ("none", {}),
+        ("subspace", dict(accelerate="subspace")),
+        ("subspace-taum100x", dict(accelerate="subspace", tau_m=100 * tau)),
+        ("dual_data", dict(accelerate="dual_data")),
+        ("dual_both", dict(accelerate="dual_both")),
+        ("dual_both-capped", dict(accelerate="dual_both", tau_max=10.0 * tau)),
+        ("linesearch", dict(linesearch=True)),
+    )
+
+    rows = []
+    for mu_value in mu_grid:
+        ref = exact_regularized_solution(pb, mu_value)
+        obj = constrained_objective(pb, mu_value)
+        finals, iters = {}, {}
+        for label, kwargs in variants:
+            projector = AffineConstraintProjector(pb.A, pb.B_list, method="smw")
+            algo = ProjectedChambollePock(
+                exp_name="part45", algo_plot_name=f"fpcheck-{label}", f=obj, C=pb.C,
+                d=pb.d_list, I=pb.I, L=pb.L, P=pb.P, tau=tau, sigma_dat=sigma,
+                sigma_reg=sigma, projector=projector, reg_mode="tikhonov",
+                mu=mu_value, **kwargs,
+            )
+            x, hist, _ = run_with_tracking(
+                algo, x0, max_iterations, objective=obj, m_ref=ref["m"],
+                f_opt=ref["f_opt"], stop_threshold=stop_threshold,
+            )
+            finals[label] = x[-pb.P :]
+            iters[label] = int(hist["iteration"][-1])
+            logger.info(
+                f"  mu={mu_value:g} {label}: {iters[label]} it, "
+                f"rel_m={hist['rel_m'][-1]:.3e}"
+            )
+        base = finals["none"]
+        base_err = float(np.linalg.norm(base - ref["m"]) / np.linalg.norm(ref["m"]))
+        for label, m_final in finals.items():
+            diff = float(np.linalg.norm(m_final - base) / np.linalg.norm(base))
+            rows.append(dict(
+                mu=mu_value,
+                kappa=ref["kappa"],
+                variant=label,
+                iterations=iters[label],
+                rel_diff_vs_unaccelerated=diff,
+                rel_diff_vs_exact=float(
+                    np.linalg.norm(m_final - ref["m"]) / np.linalg.norm(ref["m"])),
+                reference_run_converged_to=base_err,
+                passes_1e9=bool(diff < tol),
+            ))
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(dirs["results"], "section10c_fixed_point_agreement.csv"),
+              index=False)
+    logger.info("Fixed-point agreement:\n" + df.to_string(index=False))
+    return df
 
 
 if __name__ == "__main__":

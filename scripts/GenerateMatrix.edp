@@ -34,6 +34,16 @@ mesh Th = buildmesh(
   + CercleInt(NbPtOnIntBorder)
 );
 
+// Export the mesh connectivity itself, so that Python can build the true
+// finite-element inter-element jump operator of Sec. 5.2 (weighted by the
+// edge lengths |E|) instead of the structural TV proxy inferred from the
+// B_i sparsity pattern. `savemesh` writes the standard FreeFEM 2D format:
+//   nv nt nbe / nv lines "x y label" / nt lines "v1 v2 v3 region" /
+//   nbe lines "v1 v2 label", all indices 1-based.
+savemesh(Th, OutputDir + "mesh.msh");
+// (the P0/P1 dof-ordering validation exports come right after the fespace
+// declarations below, since they need FS0/FS1 to exist.)
+
 // Define an oriented boundary mesh of the external circle
 int[int] labelObject = [LabelExt];
 meshL ThN = extract(Th, label = labelObject);
@@ -52,6 +62,14 @@ fespace FSL(ThN, P1);
 cout << "Dimension of the FS0 space: " << FS0.ndof << endl;
 cout << "Dimension of the FS1 space: " << FS1.ndof << endl;
 cout << "Dimension of the FSL space: " << FSL.ndof << endl;
+
+// Ordering validation: a P0 interpolation samples at the barycentre,
+// a P1 one at the vertex. Lets Python verify the dof<->element map.
+// Written at full precision so the comparison can be made at 1e-10; the
+// default 10 significant digits would put the round-off above that.
+FS0 bx = x, by = y;   FS1 vx = x, vy = y;
+{ ofstream f(OutputDir + "P0barycenters.dat"); f.precision(17); f << bx[] << by[]; }
+{ ofstream f(OutputDir + "P1vertices.dat");    f.precision(17); f << vx[] << vy[]; }
 
 // Define the contrast m (n1 - 1) : 2 * cos(x) in the internal circle and 0 outside
 FS0 n0 = 1.0;

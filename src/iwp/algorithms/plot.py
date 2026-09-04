@@ -165,3 +165,70 @@ def plot_objective_functions_by_algorithm(list_of_algo_lists, visuals_path, add_
         plt.savefig(os.path.join(visuals_path, "Objective_by_algorithm.pdf"))
     if show:
         plt.show()
+
+
+def plot_contrast_on_mesh(
+    fields,
+    vertices,
+    triangles,
+    titles=None,
+    part="real",
+    visuals_path=None,
+    filename="contrast_on_mesh.pdf",
+    show=False,
+    save=True,
+    cmap="viridis",
+    share_scale=True,
+):
+    """Draw P0 (piecewise-constant) contrast vectors on the actual annulus.
+
+    Until the mesh connectivity was exported (`savemesh` in
+    scripts/GenerateMatrix*.edp) the comparison notebook could only plot
+    `Re(m)` against the contrast dof index, because the coordinates were not
+    available. `mesh.msh` supplies them, so a P0 field is exactly a per-face
+    colour: `tripcolor(..., facecolors=values)` on the real geometry, as in
+    the internship report's spatial iso-value plots.
+
+    Args:
+        fields: one contrast vector, or a sequence of them (each length P).
+        vertices, triangles: as returned by `iwp.utils.mesh.read_freefem_mesh`.
+        part: "real", "imag" or "abs".
+        share_scale: put every panel on a common colour scale, so panels are
+            comparable to each other rather than each self-normalized.
+    """
+    from iwp.utils.mesh import make_triangulation
+
+    if isinstance(fields, np.ndarray) and fields.ndim == 1:
+        fields = [fields]
+    fields = list(fields)
+    titles = list(titles) if titles is not None else [None] * len(fields)
+    take = {"real": np.real, "imag": np.imag, "abs": np.abs}[part]
+    values = [np.asarray(take(f), dtype=float) for f in fields]
+    for v in values:
+        if v.shape[0] != triangles.shape[0]:
+            raise ValueError(
+                f"field has {v.shape[0]} entries but the mesh has "
+                f"{triangles.shape[0]} triangles: this is a P0 (per-face) plot."
+            )
+
+    tri = make_triangulation(vertices, triangles)
+    vmin = min(v.min() for v in values) if share_scale else None
+    vmax = max(v.max() for v in values) if share_scale else None
+
+    fig, axs = plt.subplots(
+        1, len(values), figsize=(5.2 * len(values), 4.6), squeeze=False
+    )
+    for ax, v, title in zip(axs[0], values, titles):
+        tpc = ax.tripcolor(tri, facecolors=v, cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_aspect("equal")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        if title:
+            ax.set_title(title)
+        fig.colorbar(tpc, ax=ax, shrink=0.85)
+    fig.tight_layout()
+    if save and visuals_path is not None:
+        fig.savefig(os.path.join(visuals_path, filename))
+    if show:
+        plt.show()
+    return fig, axs[0]

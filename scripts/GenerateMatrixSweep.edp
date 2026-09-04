@@ -1,30 +1,70 @@
-// Parametrized variant of GenerateMatrix.edp used to generate two small
-// sweeps referenced in the Part 4/5 comparison notebook:
+// Parametrized variant of GenerateMatrix.edp used to generate the sweeps
+// referenced in the Part 4/5 comparison notebook:
 //   (a) a source-count sweep (I = 2, 4, 8, 16, 32) at fixed mesh density,
 //       to empirically test the SMW-vs-cached-factorization crossover
 //       predicted in Sec. 5.8-5.9 ("sweep (a): Source sweep");
 //   (b) a mesh-refinement sweep (delta = 10, 20, 40) at fixed I = 2, to
 //       empirically confirm ||A|| = O(1/h^2) while ||C|| stays roughly
-//       constant -- the structural claim motivating Algorithm 5's
+//       constant, the structural claim motivating Algorithm 5's
 //       mesh-robust step sizes (Sec. 5.1, 5.8: "sweep (b): Field-mesh
-//       sweep").
+//       sweep");
+//   (c) a *joint* I x delta sweep with the contrast mesh held coarse, which
+//       is the only way to reach the regime P << I*L that the SMW route of
+//       Sec. 5.4 is actually designed for. See the -delta_m flag below.
 // Geometry and wavenumber are otherwise identical to GenerateMatrix.edp.
 // Writes to its own output directory so the reference dataset in data/ is
 // untouched.
 //
-// Usage: FreeFem++ -nw scripts/GenerateMatrixSweep.edp -I 8 -delta 10 -out data/sweep/I8/
+// Usage:
+//   FreeFem++ -nw scripts/GenerateMatrixSweep.edp -I 8 -delta 10 -out data/sweep/I8/
+//   FreeFem++ -nw scripts/GenerateMatrixSweep.edp -I 8 -delta 40 -delta_m 10 \
+//             -out data/joint/I8_d40/
 //
 // Note: this FreeFEM build does not expose `getARGV`, so command-line flags
 // are parsed by hand from the raw `ARGV` array below.
+//
+// ---------------------------------------------------------------------------
+// The two-basis discretization (-delta_m)
+// ---------------------------------------------------------------------------
+// `delta` sets the density of the *field* mesh Th, carrying the P1 field basis
+// Phi_L (dimension L) on which A and C are assembled. `delta_m` sets the
+// density of a separate *contrast* mesh Thm, carrying the P0 contrast basis
+// Psi_P (dimension P). Sec. 5.8 recommends exactly this, and the ill-posedness
+// of the problem justifies it: the data cannot resolve contrast features finer
+// than a fraction of a wavelength, so there is no reason to refine Psi_P
+// alongside Phi_L.
+//
+// It is also the *only* way to drive P/(I*L) -> 0 on this geometry. A 2D
+// triangulation has roughly twice as many triangles as vertices, so with
+// delta_m = delta a P0 contrast always has P > L (here P = 394 against
+// L = 223, P = 1624 against L = 863, P = 6720 against L = 3461): refining the
+// mesh alone moves *away* from the favourable regime, never towards it.
+// Holding delta_m = 10 while delta grows keeps P = 394 and takes
+// P/(I*L) from 0.88 down to 0.0036.
+//
+// `delta_m` defaults to `delta`, so omitting it reproduces the single-mesh
+// datasets byte for byte.
+//
+// The coupling B_i is then a genuine cross-mesh Galerkin matrix,
+//     B_i[l, p] = - int_Th ( psi_p * k^2 * phi_l * u_inc^i ),
+// with psi_p a coarse-mesh P0 basis function evaluated at the fine-mesh
+// quadrature points. Its shape is (L, P) -- rows indexed by the *field* basis,
+// columns by the *contrast* basis -- which is what `A u_i = B_i m` requires and
+// what the assertion below checks explicitly. (The inverse-problem section of
+// the manuscript states this as "P x L"; that is a transposition typo, and the
+// exported shape is the authority.)
 
 string OutputDir = "data/sweep/I2/";
 int I = 2;
 int delta = 10;
+int deltam = -1;   // -1 => "same as delta" (single-mesh, legacy behaviour)
 for (int i = 0; i < ARGV.n - 1; i++) {
   if (ARGV[i] == "-out") OutputDir = ARGV[i + 1];
   if (ARGV[i] == "-I") I = atoi(ARGV[i + 1]);
   if (ARGV[i] == "-delta") delta = atoi(ARGV[i + 1]);
+  if (ARGV[i] == "-delta_m") deltam = atoi(ARGV[i + 1]);
 }
+if (deltam <= 0) deltam = delta;
 
 real k = 1.;
 real lambda = 2. * pi / k;
@@ -45,24 +85,59 @@ border CercleExt(t = 0, 2. * pi) { x = Rext * cos(t); y = Rext * sin(t); label =
 border CercleInt(t = 0, 2. * pi) { x = Rint * cos(t); y = Rint * sin(t); label = LabelInt; }
 real NbPtOnExtBorder = 2 * pi * Rext * delta / lambda;
 real NbPtOnIntBorder = 2 * pi * Rint * delta / lambda;
-cout << "I = " << I << ", NbPtOnExtBorder = " << NbPtOnExtBorder << ", NbPtOnIntBorder = " << NbPtOnIntBorder << endl;
+cout << "I = " << I << ", delta = " << delta << ", delta_m = " << deltam << endl;
+cout << "NbPtOnExtBorder = " << NbPtOnExtBorder << ", NbPtOnIntBorder = " << NbPtOnIntBorder << endl;
 mesh Th = buildmesh(
   CercleExt(NbPtOnExtBorder)
   + CercleInt(NbPtOnIntBorder)
 );
 
+// Contrast mesh. Assigned from Th when the two densities coincide, so the
+// single-mesh datasets take exactly the code path they always took.
+mesh Thm = Th;
+if (deltam != delta) {
+  Thm = buildmesh(
+    CercleExt(2 * pi * Rext * deltam / lambda)
+    + CercleInt(2 * pi * Rint * deltam / lambda)
+  );
+}
+
+// Export the mesh connectivity itself, so that Python can build the true
+// finite-element inter-element jump operator of Sec. 5.2 (edge-length
+// weighted) instead of the structural TV proxy inferred from the B_i
+// sparsity pattern. Standard FreeFEM 2D format, 1-based indices:
+//   nv nt nbe / nv x "x y label" / nt x "v1 v2 v3 region" / nbe x "v1 v2 label".
+// (the P0/P1 ordering-validation exports need FS0/FS1, see below.)
+//
+// `mesh.msh` is the field mesh (P1 dofs = L); `mesh_contrast.msh` is the mesh
+// the P0 contrast lives on. They are the same file when delta_m = delta, and
+// the regularizer operator G must always be built from the *contrast* one.
+savemesh(Th, OutputDir + "mesh.msh");
+savemesh(Thm, OutputDir + "mesh_contrast.msh");
+
+
 int[int] labelObject = [LabelExt];
 meshL ThN = extract(Th, label = labelObject);
 ThN = OrientNormal(ThN, unbounded = 1);
 
-int PtInt = Th(0., 0.).region;
+int PtInt = Thm(0., 0.).region;
 
-fespace FS0(Th, P0);
-fespace FS1(Th, P1);
-fespace FSL(ThN, P1);
-cout << "Dimension of the FS0 space: " << FS0.ndof << endl;
-cout << "Dimension of the FS1 space: " << FS1.ndof << endl;
-cout << "Dimension of the FSL space: " << FSL.ndof << endl;
+fespace FS0(Thm, P0);   // contrast basis Psi_P, on the *contrast* mesh
+fespace FS1(Th, P1);    // field basis Phi_L, on the field mesh
+fespace FSL(ThN, P1);   // receiver trace space on the outer boundary
+cout << "Dimension of the FS0 space (P): " << FS0.ndof << endl;
+cout << "Dimension of the FS1 space (L): " << FS1.ndof << endl;
+cout << "Dimension of the FSL space (J): " << FSL.ndof << endl;
+
+// Ordering validation: a P0 interpolation samples at the barycentre,
+// a P1 one at the vertex. Lets Python verify the dof<->element map.
+// Written at full precision so the comparison can be made at 1e-10; the
+// default 10 significant digits would put the round-off above that.
+// Note P0barycenters.dat now lives on Thm and P1vertices.dat on Th; when the
+// two meshes differ they have different lengths, which is itself a check.
+FS0 bx = x, by = y;   FS1 vx = x, vy = y;
+{ ofstream f(OutputDir + "P0barycenters.dat"); f.precision(17); f << bx[] << by[]; }
+{ ofstream f(OutputDir + "P1vertices.dat");    f.precision(17); f << vx[] << vy[]; }
 
 FS0 n0 = 1.0;
 FS0 n1 = 2. * cos(x) * (region == PtInt) + n0 * (region != PtInt);
@@ -94,20 +169,52 @@ matrix C = FS1toFSL * Ctmp;
   fileoutput << C;
 }
 
+// Machine-readable dimensions, so the Python side can assert the exported
+// shapes rather than infer them (and so a dataset directory is
+// self-describing once delta and delta_m no longer coincide).
+{
+  ofstream f(OutputDir + "dims.txt");
+  f << "I " << I << endl;
+  f << "delta " << delta << endl;
+  f << "delta_m " << deltam << endl;
+  f << "L " << FS1.ndof << endl;
+  f << "P " << FS0.ndof << endl;
+  f << "J " << FSL.ndof << endl;
+}
+
 for (int itercapteur = 0; itercapteur < I; itercapteur++) {
 
   func uIncident = exp(1.i * k * (cos(thetaSource(itercapteur)) * x + sin(thetaSource(itercapteur)) * y));
 
+  // Cross-mesh Galerkin coupling: trial space FS0 lives on Thm, test space
+  // FS1 on Th, and the integral is taken over the *field* mesh Th, so a
+  // coarse basis function is sampled at the fine mesh's quadrature points.
+  // When Thm is Th this is the ordinary single-mesh assembly.
   varf Lin(u, v) = - int2d(Th)(u * k^2 * v * uIncident);
   matrix<complex> B = Lin(FS0, FS1);
+
+  // The shape check the manuscript's "P x L" typo makes worth stating in
+  // code: rows = field dofs L, columns = contrast dofs P.
+  if (B.n != FS1.ndof || B.m != FS0.ndof) {
+    cout << "FATAL: B_" << itercapteur << " has shape " << B.n << " x " << B.m
+         << ", expected " << FS1.ndof << " x " << FS0.ndof << endl;
+    exit(1);
+  }
+  if (itercapteur == 0) {
+    cout << "B_0 shape: " << B.n << " x " << B.m << " (L x P), nnz = " << B.nbcoef << endl;
+  }
 
   {
     ofstream fileoutput(OutputDir + "MatrixB_" + itercapteur + ".dat");
     fileoutput << B;
   }
 
-  varf LinIndice(unused, v) = - int2d(Th)(m * k^2 * v * uIncident);
-  complex[int] rhs = LinIndice(0., FS1);
+  // Synthetic data, generated through the *exported* operator rather than a
+  // second variational form. Algebraically identical to the single-mesh
+  // `varf LinIndice` it replaces (same quadrature, same integrand), and it
+  // keeps d_i exactly in the range of C A^-1 B_i once the two meshes differ,
+  // which is what makes the feasibility residual a meaningful diagnostic.
+  complex[int] rhs = B * m[];
 
   FS1<complex> usol;
   usol[] = ABorn^-1 * rhs;
