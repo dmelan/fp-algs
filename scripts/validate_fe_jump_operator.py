@@ -51,6 +51,9 @@ from iwp.utils.operators import (  # noqa: E402
 )
 
 SWEEP_ROOT = os.path.join("data", "sweep")
+# Densities to validate. These checks need no algorithm iterations (parsing,
+# a few power iterations, and one TV evaluation each), so the sweep can go
+# finer than the iterative studies: pass --deltas to change it.
 DELTAS = (10, 20, 40)
 
 
@@ -84,7 +87,7 @@ def continuum_tv_reference(n_radial=4000, n_theta=4000):
     return interior + jump, interior, jump
 
 
-def main():
+def main(deltas=DELTAS, tag=""):
     results_dir = os.path.join("runs", "fe_jump", "results")
     visuals_dir = os.path.join("runs", "fe_jump", "visuals")
     os.makedirs(results_dir, exist_ok=True)
@@ -93,7 +96,7 @@ def main():
     all_ok = True
     rows = []
 
-    for delta in DELTAS:
+    for delta in deltas:
         path = os.path.join(SWEEP_ROOT, f"delta{delta}")
         if not os.path.isdir(path):
             print(f"skipping delta={delta}: {path} not found")
@@ -287,7 +290,7 @@ def main():
         )
 
     df = pd.DataFrame(rows)
-    df.to_csv(os.path.join(results_dir, "validation_abcde.csv"), index=False)
+    df.to_csv(os.path.join(results_dir, f"validation_abcde{tag}.csv"), index=False)
 
     # ---------------- (d)/(e) verdicts across the sweep --------------------
     print("\n=== across the refinement sweep ===")
@@ -421,7 +424,7 @@ def main():
         for ax in axs:
             ax.grid(True, which="both", alpha=0.3)
         fig.tight_layout()
-        out = os.path.join(visuals_dir, "validation_d_tv_refinement.pdf")
+        out = os.path.join(visuals_dir, f"validation_d_tv_refinement{tag}.pdf")
         fig.savefig(out)
         fig.savefig(out.replace(".pdf", ".png"), dpi=140)
         print(f"\n  figure written to {out}")
@@ -432,4 +435,10 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--deltas", default=",".join(str(d) for d in DELTAS))
+    ap.add_argument("--tag", default="", help="suffix for the output filenames")
+    a = ap.parse_args()
+    raise SystemExit(main(tuple(int(d) for d in a.deltas.split(",")), a.tag))

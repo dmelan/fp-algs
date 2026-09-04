@@ -93,9 +93,16 @@ def mse_mae(x, m_true, P):
 
 
 def make_projector(pb, max_dense_P=2000):
-    """Exact SMW where the dense `P x P` capacitance fits comfortably, and the
-    matrix-free CG variant beyond that: at delta=40 the capacitance alone is
-    P^2 * 16 = 722 MB, more than this machine has free."""
+    """Exact SMW where the dense `P x P` capacitance is small, and the
+    matrix-free CG variant beyond that.
+
+    The threshold is about speed, not only memory. Measured at delta=40
+    (L=3461, P=6720) on a 372 GB machine, where the 722 MB capacitance fits
+    easily: 100 iterations cost 21.0s with "smw" against 22.2s with "smw_cg",
+    while setup costs 62.4s against 0.7s, and both reach the same iterate
+    (MSE 0.693926 either way). The dense capacitance solve is memory-bandwidth
+    bound at that size, so it buys back none of its setup. Raising this
+    threshold is therefore not worth it even with the RAM to spare."""
     method = "smw" if pb.P <= max_dense_P else "smw_cg"
     kwargs = {} if method == "smw" else {"cg_gamma": 0.7}
     return AffineConstraintProjector(pb.A, pb.B_list, method=method, **kwargs)
